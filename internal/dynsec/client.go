@@ -13,16 +13,15 @@ package dynsec
 
 import (
 	"context"
-	"crypto/tls"
-	"crypto/x509"
 	"encoding/json"
 	"fmt"
-	"os"
 	"sync"
 	"time"
 
 	mqtt "github.com/eclipse/paho.mqtt.golang"
 	"github.com/google/uuid"
+
+	"github.com/Ritesh956/SenseGrid/internal/tlsutil"
 )
 
 const (
@@ -103,7 +102,7 @@ func Connect(cfg Config) (*Client, error) {
 		})
 
 	if cfg.CAFile != "" {
-		tlsCfg, err := tlsConfigFromCA(cfg.CAFile)
+		tlsCfg, err := tlsutil.FromCAFile(cfg.CAFile)
 		if err != nil {
 			return nil, fmt.Errorf("dynsec: loading CA: %w", err)
 		}
@@ -219,16 +218,4 @@ func (c *Client) CreateClient(ctx context.Context, deviceID, password, textname,
 		return fmt.Errorf("dynsec: createClient %q: %s", deviceID, resp.Error)
 	}
 	return nil
-}
-
-func tlsConfigFromCA(caFile string) (*tls.Config, error) {
-	pem, err := os.ReadFile(caFile)
-	if err != nil {
-		return nil, err
-	}
-	pool := x509.NewCertPool()
-	if !pool.AppendCertsFromPEM(pem) {
-		return nil, fmt.Errorf("no certificates found in %s", caFile)
-	}
-	return &tls.Config{RootCAs: pool, MinVersion: tls.VersionTLS12}, nil
 }
