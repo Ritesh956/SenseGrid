@@ -1,0 +1,8 @@
+{
+  "name": "SenseGrid Sensor",
+  "short_name": "SenseGrid",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#0d1312",
+  "theme_color": "#0c8e80"
+}

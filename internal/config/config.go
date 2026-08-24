@@ -18,9 +18,13 @@ type Config struct {
 	LogLevel    string
 
 	HTTPAddr        string
+	HTTPTLSCertFile string
+	HTTPTLSKeyFile  string
 	ShutdownTimeout time.Duration
 
 	MQTTBrokerURL string
+	MQTTAdminUser string
+	MQTTAdminPass string
 	NATSURL       string
 	PostgresDSN   string
 	RedisAddr     string
@@ -36,9 +40,13 @@ func Load(serviceName, defaultHTTPAddr string) Config {
 		LogLevel:    getEnv("LOG_LEVEL", "info"),
 
 		HTTPAddr:        getEnv("HTTP_ADDR", defaultHTTPAddr),
+		HTTPTLSCertFile: getEnv("HTTP_TLS_CERT_FILE", ""),
+		HTTPTLSKeyFile:  getEnv("HTTP_TLS_KEY_FILE", ""),
 		ShutdownTimeout: getDuration("SHUTDOWN_TIMEOUT", 10*time.Second),
 
 		MQTTBrokerURL: getEnv("MQTT_BROKER_URL", "tls://localhost:8883"),
+		MQTTAdminUser: getEnv("MQTT_ADMIN_USERNAME", ""),
+		MQTTAdminPass: getEnv("MQTT_ADMIN_PASSWORD", ""),
 		NATSURL:       getEnv("NATS_URL", "nats://localhost:4222"),
 		PostgresDSN:   getEnv("POSTGRES_DSN", "postgres://sensegrid:sensegrid@localhost:5432/sensegrid?sslmode=disable"),
 		RedisAddr:     getEnv("REDIS_ADDR", "localhost:6379"),
@@ -53,7 +61,9 @@ func (c Config) LogValue() slog.Value {
 		slog.String("environment", c.Environment),
 		slog.String("log_level", c.LogLevel),
 		slog.String("http_addr", c.HTTPAddr),
+		slog.Bool("http_tls_enabled", c.HTTPTLSCertFile != "" && c.HTTPTLSKeyFile != ""),
 		slog.String("mqtt_broker_url", c.MQTTBrokerURL),
+		slog.Bool("mqtt_admin_configured", c.MQTTAdminUser != "" && c.MQTTAdminPass != ""),
 		slog.String("nats_url", c.NATSURL),
 		slog.String("redis_addr", c.RedisAddr),
 		slog.Bool("postgres_dsn_set", c.PostgresDSN != ""),

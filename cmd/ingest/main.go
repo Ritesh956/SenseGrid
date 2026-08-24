@@ -25,7 +25,7 @@ func main() {
 	defer stop()
 
 	srv, _ := httpserver.New(cfg.HTTPAddr)
-	if err := httpserver.Run(ctx, srv, cfg.ShutdownTimeout, logger); err != nil {
+	if err := httpserver.Run(ctx, srv, cfg.ShutdownTimeout, cfg.HTTPTLSCertFile, cfg.HTTPTLSKeyFile, logger); err != nil {
 		logger.Error("server exited with error", "err", err)
 		os.Exit(1)
 	}

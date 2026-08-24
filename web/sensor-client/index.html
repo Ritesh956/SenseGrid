@@ -1,0 +1,60 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <title>SenseGrid Sensor</title>
+  <link rel="manifest" href="/manifest.webmanifest" />
+  <meta name="theme-color" content="#0c8e80" />
+  <link rel="stylesheet" href="/style.css" />
+</head>
+<body>
+  <header>
+    <span class="dot"></span>
+    <h1>SenseGrid</h1>
+  </header>
+
+  <main>
+    <section id="claim-view" hidden>
+      <h2>Register this device</h2>
+      <p class="muted">Enter the one-time registration token your admin issued (via <code>control token create</code>).</p>
+      <form id="claim-form">
+        <label for="token-input">Registration token</label>
+        <input id="token-input" name="token" type="text" autocomplete="off" autocapitalize="off" spellcheck="false" required />
+        <button id="claim-submit" type="submit">Register device</button>
+        <p id="claim-error" class="error" role="alert"></p>
+      </form>
+    </section>
+
+    <section id="dash-view" hidden>
+      <div class="device-card">
+        <div>
+          <div class="device-name" id="device-name"></div>
+          <div class="muted"><span id="device-type"></span> &middot; <code id="device-id"></code></div>
+        </div>
+        <span id="status-pill" class="pill" data-status="disconnected">disconnected</span>
+      </div>
+
+      <p id="dash-error" class="error" role="alert"></p>
+
+      <div class="controls">
+        <label for="rate-input">Sample rate (Hz)</label>
+        <input id="rate-input" type="number" min="1" max="60" value="20" />
+
+        <button id="perm-btn" type="button">Start streaming</button>
+        <button id="stop-btn" type="button" hidden>Stop</button>
+      </div>
+
+      <dl class="stats">
+        <div><dt>Readings sent</dt><dd id="sent-count">0</dd></div>
+        <div><dt>Queued (offline)</dt><dd id="queued-count">0</dd></div>
+        <div><dt>Network</dt><dd id="network-type">&mdash;</dd></div>
+      </dl>
+
+      <button id="forget-btn" type="button" class="link-btn">Forget this device</button>
+    </section>
+  </main>
+
+  <script type="module" src="/app.js"></script>
+</body>
+</html>
