@@ -1,0 +1,168 @@
+networks:
+  sensegrid:
+
+volumes:
+  mosquitto_data:
+  nats_data:
+  timescale_data:
+  redis_data:
+
+x-go-service: &go-service
+  build:
+    context: ..
+    dockerfile: deploy/docker/go.Dockerfile
+  networks: [sensegrid]
+  volumes:
+    - ./certs:/certs:ro
+  environment: &go-env
+    SENSEGRID_ENV: ${SENSEGRID_ENV:-dev}
+    LOG_LEVEL: ${LOG_LEVEL:-info}
+    MQTT_BROKER_URL: ${MQTT_BROKER_URL:-tls://mosquitto:8883}
+    NATS_URL: ${NATS_URL:-nats://nats:4222}
+    POSTGRES_DSN: postgres://${POSTGRES_USER:-sensegrid}:${POSTGRES_PASSWORD:-sensegrid-dev}@timescaledb:5432/${POSTGRES_DB:-sensegrid}?sslmode=verify-ca&sslrootcert=/certs/ca.pem
+    REDIS_ADDR: ${REDIS_ADDR:-redis:6379}
+    TLS_CA_FILE: ${TLS_CA_FILE:-/certs/ca.pem}
+
+services:
+  mosquitto:
+    build:
+      context: ..
+      dockerfile: deploy/docker/mosquitto.Dockerfile
+    networks: [sensegrid]
+    ports:
+      - "8883:8883"
+    volumes:
+      - mosquitto_data:/mosquitto/data
+    healthcheck:
+      test: ["CMD", "mosquitto_sub", "-h", "localhost", "-p", "1883", "-t", "$$SYS/#", "-C", "1", "-i", "healthcheck", "-W", "3"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+
+  nats:
+    image: nats:2-alpine
+    command: ["-js", "-sd", "/data", "-m", "8222"]
+    networks: [sensegrid]
+    ports:
+      - "4222:4222"
+      - "8222:8222"
+    volumes:
+      - nats_data:/data
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8222/healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+
+  timescaledb:
+    build:
+      context: ..
+      dockerfile: deploy/docker/timescaledb.Dockerfile
+    networks: [sensegrid]
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-sensegrid}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-sensegrid-dev}
+      POSTGRES_DB: ${POSTGRES_DB:-sensegrid}
+    ports:
+      - "5432:5432"
+    volumes:
+      - timescale_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-sensegrid} -d ${POSTGRES_DB:-sensegrid}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  redis:
+    image: redis:7-alpine
+    networks: [sensegrid]
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+
+  # --- Go services -----------------------------------------------------
+  # hostagent is deliberately not a compose service: it exists to read the
+  # *host* machine's real CPU/battery/WiFi metrics (Phase 1), which a
+  # container can't see. Run it natively with `make run-hostagent`.
+
+  ingest:
+    <<: *go-service
+    build:
+      context: ..
+      dockerfile: deploy/docker/go.Dockerfile
+      args:
+        SERVICE: ingest
+    environment:
+      <<: *go-env
+      HTTP_ADDR: ":8081"
+    ports:
+      - "8081:8081"
+    depends_on:
+      mosquitto:
+        condition: service_healthy
+      nats:
+        condition: service_healthy
+
+  processor:
+    <<: *go-service
+    build:
+      context: ..
+      dockerfile: deploy/docker/go.Dockerfile
+      args:
+        SERVICE: processor
+    environment:
+      <<: *go-env
+      HTTP_ADDR: ":8082"
+    ports:
+      - "8082:8082"
+    depends_on:
+      nats:
+        condition: service_healthy
+      timescaledb:
+        condition: service_healthy
+
+  control:
+    <<: *go-service
+    build:
+      context: ..
+      dockerfile: deploy/docker/go.Dockerfile
+      args:
+        SERVICE: control
+    environment:
+      <<: *go-env
+      HTTP_ADDR: ":8080"
+    ports:
+      - "8090:8080" # host 8080 was already in use on the dev machine
+    depends_on:
+      nats:
+        condition: service_healthy
+      timescaledb:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  fleet:
+    <<: *go-service
+    build:
+      context: ..
+      dockerfile: deploy/docker/go.Dockerfile
+      args:
+        SERVICE: fleet
+    environment:
+      <<: *go-env
+      HTTP_ADDR: ":8083"
+    ports:
+      - "8083:8083"
+    depends_on:
+      mosquitto:
+        condition: service_healthy
