@@ -29,12 +29,30 @@ export class SensorSampler {
     this.rateHz = rateHz;
     this.callback = callback;
     this._last = { accel: 0, gyro: 0, orientation: 0 };
+    // enabled_sensors (Phase 4): all on by default, matching pre-Phase-4
+    // behavior — a device that's never received a desired config samples
+    // exactly as it always did.
+    this._enabled = { accel: true, gyro: true, orientation: true };
     this._motionHandler = this._onMotion.bind(this);
     this._orientationHandler = this._onOrientation.bind(this);
   }
 
   setRate(rateHz) {
     this.rateHz = rateHz;
+  }
+
+  // setEnabledSensors(null) re-enables everything (the "omit the field"
+  // convention shared with cmd/hostagent's applyPartial); otherwise only
+  // sensor types present in `sensors` are sampled.
+  setEnabledSensors(sensors) {
+    if (!sensors) {
+      this._enabled = { accel: true, gyro: true, orientation: true };
+      return;
+    }
+    this._enabled = { accel: false, gyro: false, orientation: false };
+    for (const s of sensors) {
+      if (s in this._enabled) this._enabled[s] = true;
+    }
   }
 
   start() {
@@ -59,16 +77,16 @@ export class SensorSampler {
     const accel = evt.acceleration && isFinite(evt.acceleration.x)
       ? evt.acceleration
       : evt.accelerationIncludingGravity;
-    if (accel && isFinite(accel.x) && this._throttle("accel")) {
+    if (this._enabled.accel && accel && isFinite(accel.x) && this._throttle("accel")) {
       this.callback("accel", { x: accel.x, y: accel.y, z: accel.z });
     }
-    if (evt.rotationRate && isFinite(evt.rotationRate.alpha) && this._throttle("gyro")) {
+    if (this._enabled.gyro && evt.rotationRate && isFinite(evt.rotationRate.alpha) && this._throttle("gyro")) {
       this.callback("gyro", { x: evt.rotationRate.alpha, y: evt.rotationRate.beta, z: evt.rotationRate.gamma });
     }
   }
 
   _onOrientation(evt) {
-    if (!isFinite(evt.alpha) || !this._throttle("orientation")) return;
+    if (!this._enabled.orientation || !isFinite(evt.alpha) || !this._throttle("orientation")) return;
     this.callback("orientation", { x: evt.alpha, y: evt.beta, z: evt.gamma });
   }
 }

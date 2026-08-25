@@ -94,10 +94,27 @@ func (s *Store) Resolve(ctx context.Context, deviceID, sensorType, ruleName stri
 	return a, nil
 }
 
-// Acknowledge transitions a firing alert (by id) to Acknowledged. Not
-// called anywhere in Phase 3 — it exists for Phase 4's
-// POST /v1/alerts/{id}/ack handler to call without needing to touch this
-// package.
+// ResolveByID transitions a non-resolved alert (by id) to Resolved — the
+// operator-driven counterpart to the key-based Resolve above (which
+// anomaly.Evaluator uses for automatic clear-on-condition). Used by
+// Phase 4's POST /v1/alerts/{id}/resolve handler.
+func (s *Store) ResolveByID(ctx context.Context, id string, resolvedAt time.Time) (*Alert, error) {
+	row := s.pool.QueryRow(ctx, `
+		UPDATE alerts SET state = 'resolved', resolved_at = $2, updated_at = now()
+		WHERE id = $1 AND state <> 'resolved'
+		RETURNING `+alertColumns, id, resolvedAt)
+	a, err := scanAlert(row)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, fmt.Errorf("alerts: %s is not an open alert", id)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("alerts: resolving %s: %w", id, err)
+	}
+	return a, nil
+}
+
+// Acknowledge transitions a firing alert (by id) to Acknowledged. Used by
+// Phase 4's POST /v1/alerts/{id}/ack handler.
 func (s *Store) Acknowledge(ctx context.Context, id string) (*Alert, error) {
 	row := s.pool.QueryRow(ctx, `
 		UPDATE alerts SET state = 'acknowledged', acknowledged_at = now(), updated_at = now()

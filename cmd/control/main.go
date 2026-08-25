@@ -1,7 +1,10 @@
-// Command control is the control plane. In Phase 1 it does two things:
-// issue one-time device registration tokens (CLI), and serve the device
-// claim API plus the PWA sensor client's static files (HTTP). Device
-// shadow, staged rollouts, and JWT-gated admin endpoints land in Phase 4.
+// Command control is the control plane. Phase 1-3 gave it device claiming
+// (CLI-issued tokens + POST /v1/devices/claim) and the PWA's static files.
+// Phase 4 adds: JWT-gated REST endpoints (auth.go), the device shadow —
+// JetStream KV-backed desired/reported config, retained-published to
+// devices and reconciled from their state reports (internal/shadow) — and
+// alert ack/resolve (reusing internal/alerts, built for cmd/processor in
+// Phase 3). Staged rollouts are a separate follow-up phase, not here yet.
 package main
 
 import (
@@ -14,8 +17,13 @@ import (
 	"syscall"
 	"time"
 
+	mqtt "github.com/eclipse/paho.mqtt.golang"
+	"github.com/nats-io/nats.go"
+	"github.com/nats-io/nats.go/jetstream"
+
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/Ritesh956/SenseGrid/internal/alerts"
 	"github.com/Ritesh956/SenseGrid/internal/config"
 	"github.com/Ritesh956/SenseGrid/internal/devices"
 	"github.com/Ritesh956/SenseGrid/internal/devicestore"
@@ -23,17 +31,27 @@ import (
 	"github.com/Ritesh956/SenseGrid/internal/httpserver"
 	"github.com/Ritesh956/SenseGrid/internal/logging"
 	"github.com/Ritesh956/SenseGrid/internal/migrations"
+	"github.com/Ritesh956/SenseGrid/internal/shadow"
+	"github.com/Ritesh956/SenseGrid/internal/tlsutil"
 )
 
 const (
 	defaultHTTPAddr = ":8080"
 	deviceRoleName  = "device"
 	bridgeRoleName  = "bridge"
+	controlRoleName = "control"
 )
 
 func main() {
 	if len(os.Args) > 1 && os.Args[1] == "token" {
 		if err := runTokenCLI(os.Args[2:]); err != nil {
+			fmt.Fprintln(os.Stderr, "error:", err)
+			os.Exit(1)
+		}
+		return
+	}
+	if len(os.Args) > 1 && os.Args[1] == "jwt" {
+		if err := runJWTCLI(os.Args[2:]); err != nil {
 			fmt.Fprintln(os.Stderr, "error:", err)
 			os.Exit(1)
 		}
@@ -74,13 +92,53 @@ func runServer() {
 	logger.Info("postgres: migrations up to date")
 	deviceStore := devices.New(pool)
 
+	if cfg.JWTSigningKey == "" {
+		logger.Error("JWT_SIGNING_KEY is not set — required for Phase 4's auth-gated endpoints")
+		os.Exit(1)
+	}
+	signingKey := []byte(cfg.JWTSigningKey)
+
 	dynsecClient := connectDynsec(ctx, cfg, logger)
 	if dynsecClient != nil {
 		defer dynsecClient.Disconnect()
 	}
 
+	nc, err := nats.Connect(cfg.NATSURL)
+	if err != nil {
+		logger.Error("nats: connect", "err", err)
+		os.Exit(1)
+	}
+	defer nc.Close()
+
+	js, err := jetstream.New(nc)
+	if err != nil {
+		logger.Error("jetstream: init", "err", err)
+		os.Exit(1)
+	}
+
+	kv, err := shadow.EnsureBucket(ctx, js)
+	if err != nil {
+		logger.Error("shadow: ensuring bucket", "err", err)
+		os.Exit(1)
+	}
+	shadowStore := shadow.NewStore(kv, pool)
+	alertsStore := alerts.NewStore(pool)
+	alertsPub := alerts.NewPublisher(js)
+
+	reconciler := shadow.NewReconciler(shadowStore, deviceStore, logger)
+	controlMQTT, err := connectControlMQTT(cfg, logger, reconciler)
+	var shadowPub *shadow.Publisher
+	if err != nil {
+		logger.Error("mqtt: control identity connect failed, shadow publish/reconcile unavailable until this recovers", "err", err)
+	} else {
+		defer controlMQTT.Disconnect(250)
+		shadowPub = shadow.NewPublisher(controlMQTT)
+	}
+
 	srv, mux := httpserver.New(cfg.HTTPAddr)
 	registerClaimHandler(mux, logger, tokens, deviceStore, dynsecClient)
+	registerDeviceHandlers(mux, logger, deviceStore, shadowStore, shadowPub, cfg.DriftStaleAfter, cfg.JWTIssuer, signingKey)
+	registerAlertHandlers(mux, logger, alertsStore, alertsPub, cfg.JWTIssuer, signingKey)
 	registerStaticFiles(mux)
 
 	if err := httpserver.Run(ctx, srv, cfg.ShutdownTimeout, cfg.HTTPTLSCertFile, cfg.HTTPTLSKeyFile, logger); err != nil {
@@ -88,6 +146,56 @@ func runServer() {
 		os.Exit(1)
 	}
 	logger.Info("shutdown complete")
+}
+
+// connectControlMQTT connects cmd/control's own MQTT identity — the
+// "control" role, wildcard publish on every device's config topic and
+// wildcard subscribe on every device's state topic (see connectDynsec) —
+// and starts reconciler on every successful (re)connect, matching
+// cmd/hostagent's connectMQTT pattern for why that has to be an
+// OnConnectHandler and not a one-time post-Connect call.
+func connectControlMQTT(cfg config.Config, logger *slog.Logger, reconciler *shadow.Reconciler) (mqtt.Client, error) {
+	if cfg.MQTTControlUser == "" || cfg.MQTTControlPass == "" {
+		return nil, fmt.Errorf("MQTT_CONTROL_USERNAME/MQTT_CONTROL_PASSWORD not set")
+	}
+	caFile := cfg.TLSCAFile
+	if caFile == "" {
+		caFile = "deploy/certs/ca.pem"
+	}
+	tlsCfg, err := tlsutil.FromCAFile(caFile)
+	if err != nil {
+		return nil, fmt.Errorf("loading CA: %w", err)
+	}
+
+	opts := mqtt.NewClientOptions().
+		AddBroker(cfg.MQTTBrokerURL).
+		SetClientID("control-plane").
+		SetUsername(cfg.MQTTControlUser).
+		SetPassword(cfg.MQTTControlPass).
+		SetTLSConfig(tlsCfg).
+		SetConnectTimeout(10 * time.Second).
+		SetAutoReconnect(true).
+		SetConnectRetryInterval(2 * time.Second).
+		SetMaxReconnectInterval(30 * time.Second).
+		SetConnectionLostHandler(func(_ mqtt.Client, err error) {
+			logger.Warn("mqtt: control identity connection lost, reconnecting with backoff", "err", err)
+		})
+	opts.SetOnConnectHandler(func(c mqtt.Client) {
+		logger.Info("mqtt: control identity connected")
+		if err := reconciler.Start(c); err != nil {
+			logger.Error("shadow: subscribing to state topic failed", "err", err)
+		}
+	})
+
+	client := mqtt.NewClient(opts)
+	token := client.Connect()
+	if !token.WaitTimeout(10 * time.Second) {
+		return nil, fmt.Errorf("connect timed out")
+	}
+	if err := token.Error(); err != nil {
+		return nil, err
+	}
+	return client, nil
 }
 
 // connectDynsec connects to the broker's dynamic-security control channel
@@ -153,6 +261,29 @@ func connectDynsec(ctx context.Context, cfg config.Config, logger *slog.Logger) 
 		return client
 	}
 	logger.Info("dynsec: bridge role and account ready")
+
+	if cfg.MQTTControlUser == "" || cfg.MQTTControlPass == "" {
+		logger.Warn("MQTT_CONTROL_USERNAME/MQTT_CONTROL_PASSWORD not set, skipping control role/account bootstrap")
+		return client
+	}
+	// Phase 4: cmd/control needs its own broker identity, distinct from
+	// bridge, to retained-publish desired config to any device's config
+	// topic and to receive every device's reported state — a device's own
+	// "device" role ACL only lets *it* subscribe/publish its own topics
+	// (see deviceRoleName's ACLs above), not push to or read from others.
+	if err := client.EnsureRole(bootstrapCtx, controlRoleName, "SenseGrid control plane", []dynsec.ACL{
+		{ACLType: "publishClientSend", Topic: "sensegrid/v1/+/config", Priority: -1, Allow: true},
+		{ACLType: "subscribeLiteral", Topic: "sensegrid/v1/+/state", Priority: -1, Allow: true},
+		{ACLType: "publishClientReceive", Topic: "sensegrid/v1/+/state", Priority: -1, Allow: true},
+	}); err != nil {
+		logger.Error("dynsec: bootstrap control role failed", "err", err)
+		return client
+	}
+	if err := client.CreateClient(bootstrapCtx, cfg.MQTTControlUser, cfg.MQTTControlPass, "control plane service account", controlRoleName); err != nil {
+		logger.Error("dynsec: bootstrap control account failed", "err", err)
+		return client
+	}
+	logger.Info("dynsec: control role and account ready")
 	return client
 }
 

@@ -1,12 +1,16 @@
-// Minimal MQTT 3.1.1-over-WebSocket client: CONNECT, PUBLISH (QoS 0 only),
+// Minimal MQTT 3.1.1-over-WebSocket client: CONNECT, PUBLISH (send at QoS
+// 0; receive at QoS 0 or 1, with PUBACK for the latter), SUBSCRIBE/SUBACK,
 // PINGREQ/PINGRESP keepalive, auto-reconnect with backoff, and a bounded
 // in-memory publish queue that drains on reconnect.
 //
 // Deliberately hand-rolled instead of vendoring a third-party MQTT.js
-// bundle: this device only ever publishes (no subscribe in Phase 1), so
-// the wire format needed is small enough to implement directly and verify
-// against the MQTT 3.1.1 spec, with no external dependency to trust or to
-// fetch at build/runtime.
+// bundle: the wire format needed is small enough to implement directly and
+// verify against the MQTT 3.1.1 spec, with no external dependency to trust
+// or to fetch at build/runtime. Phase 4 added SUBSCRIBE/incoming-PUBLISH
+// support (previously publish-only) so the device can receive its
+// retained shadow config — see app.js's use of subscribe()/onMessage.
+// Outbound publishes stay QoS 0 (see publish()'s doc comment for why that
+// didn't need to change).
 //
 // Packet framing verified against docs.oasis-open.org/mqtt/mqtt/v3.1.1/os/.
 
@@ -49,9 +53,12 @@ function concatBytes(parts) {
 
 // Reads one complete MQTT packet from the front of buf, or returns null if
 // buf doesn't yet contain a full packet (caller should wait for more data).
+// flags is the fixed header's low nibble — DUP/QoS/RETAIN for PUBLISH,
+// meaningless (but harmless to return) for every other packet type.
 function decodeOnePacket(buf) {
   if (buf.length < 2) return null;
   const type = buf[0] >> 4;
+  const flags = buf[0] & 0x0f;
 
   let multiplier = 1;
   let remainingLength = 0;
@@ -67,7 +74,7 @@ function decodeOnePacket(buf) {
 
   const totalLength = idx + remainingLength;
   if (buf.length < totalLength) return null;
-  return { type, payload: buf.slice(idx, totalLength), totalLength };
+  return { type, flags, payload: buf.slice(idx, totalLength), totalLength };
 }
 
 export class MQTTClient {
@@ -81,6 +88,7 @@ export class MQTTClient {
     this.connected = false;
     this.stats = { sent: 0, queued: 0, dropped: 0, reconnects: 0 };
     this.onStatusChange = null; // (status: 'connecting'|'connected'|'disconnected'|'error', detail?) => void
+    this.onMessage = null; // (topic: string, payload: Uint8Array) => void
 
     this._ws = null;
     this._rxBuf = new Uint8Array(0);
@@ -90,6 +98,18 @@ export class MQTTClient {
     this._pingTimer = null;
     this._pongDeadline = null;
     this._closedByUser = false;
+    this._subscriptions = []; // topic filters to (re)subscribe on every connect — clean sessions drop them on reconnect
+    this._nextPacketId = 1;
+  }
+
+  // subscribe registers topic for delivery (QoS 1 by default — the config
+  // topic is retained-published at QoS 1). Re-sent automatically on every
+  // (re)connect, matching cmd/hostagent's OnConnectHandler resubscribe —
+  // MQTT clean sessions (which this client always uses) don't persist
+  // subscriptions across a reconnect at the broker either.
+  subscribe(topic, qos = 1) {
+    if (!this._subscriptions.includes(topic)) this._subscriptions.push(topic);
+    if (this.connected) this._sendSubscribe(topic, qos);
   }
 
   start() {
@@ -136,6 +156,28 @@ export class MQTTClient {
     const fixedHeader = concatBytes([Uint8Array.of(0x30), encodeRemainingLength(body.length)]);
     this._ws.send(concatBytes([fixedHeader, body]));
     this.stats.sent++;
+  }
+
+  _sendSubscribe(topic, qos) {
+    const packetId = this._nextPacketId++;
+    if (this._nextPacketId > 0xffff) this._nextPacketId = 1;
+    const variableHeader = Uint8Array.of((packetId >> 8) & 0xff, packetId & 0xff);
+    const payload = concatBytes([encodeUTF8String(topic), Uint8Array.of(qos)]);
+    const body = concatBytes([variableHeader, payload]);
+    // Fixed header 0x82: type 8 (SUBSCRIBE), flags 0b0010 — mandatory per
+    // the spec, not a QoS marker.
+    const fixedHeader = concatBytes([Uint8Array.of(0x82), encodeRemainingLength(body.length)]);
+    this._ws.send(concatBytes([fixedHeader, body]));
+  }
+
+  _sendPuback(packetId) {
+    const body = Uint8Array.of((packetId >> 8) & 0xff, packetId & 0xff);
+    const fixedHeader = Uint8Array.of(0x40, body.length); // type 4 (PUBACK)
+    this._ws.send(concatBytes([fixedHeader, body]));
+  }
+
+  _resubscribeAll() {
+    for (const topic of this._subscriptions) this._sendSubscribe(topic, 1);
   }
 
   _connect() {
@@ -214,7 +256,7 @@ export class MQTTClient {
     }
   }
 
-  _handlePacket({ type, payload }) {
+  _handlePacket({ type, flags, payload }) {
     if (type === 2) {
       // CONNACK
       const returnCode = payload[1];
@@ -223,16 +265,43 @@ export class MQTTClient {
         this._reconnectDelay = RECONNECT_BASE_MS;
         this._setStatus("connected");
         this._startKeepalive();
+        this._resubscribeAll();
         this._flushQueue();
       } else {
         this._setStatus("error", `broker rejected connection (code ${returnCode})`);
         this._ws.close();
       }
+    } else if (type === 3) {
+      // PUBLISH (incoming) — the retained shadow config arrives this way.
+      this._handleIncomingPublish(flags, payload);
+    } else if (type === 9) {
+      // SUBACK — no per-request tracking; a rejected subscription would
+      // simply mean this client never receives that topic, which
+      // onStatusChange's "connected" state doesn't currently distinguish
+      // from "subscribed". Acceptable for a single, always-granted-by-ACL
+      // topic (the device's own config topic).
     } else if (type === 13) {
       // PINGRESP
       this._pongDeadline = null;
     }
-    // PUBACK (4) and others are ignored: telemetry publishes at QoS 0.
+    // PUBACK (4) and others are ignored: outbound telemetry/state publishes are QoS 0.
+  }
+
+  _handleIncomingPublish(flags, payload) {
+    const qos = (flags >> 1) & 0x03;
+    const topicLen = (payload[0] << 8) | payload[1];
+    const topic = new TextDecoder().decode(payload.slice(2, 2 + topicLen));
+    let idx = 2 + topicLen;
+
+    let packetId = null;
+    if (qos > 0) {
+      packetId = (payload[idx] << 8) | payload[idx + 1];
+      idx += 2;
+    }
+    const msgPayload = payload.slice(idx);
+
+    if (qos === 1 && packetId !== null) this._sendPuback(packetId);
+    if (this.onMessage) this.onMessage(topic, msgPayload);
   }
 
   _startKeepalive() {

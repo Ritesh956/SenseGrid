@@ -10,6 +10,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"strings"
 
 	"github.com/google/uuid"
 )
@@ -85,6 +86,32 @@ type StampedReading struct {
 // TelemetryTopic returns the MQTT topic a device publishes readings to.
 func TelemetryTopic(deviceID string) string {
 	return "sensegrid/v1/" + deviceID + "/telemetry"
+}
+
+// ConfigTopic returns the MQTT topic cmd/control retained-publishes a
+// device's desired shadow state to (Phase 4), and the topic every device
+// subscribes to on connect. The broker ACLs for this were already
+// provisioned in Phase 1/2 (see cmd/control/main.go's connectDynsec) —
+// Phase 4 is the first code to actually use them.
+func ConfigTopic(deviceID string) string {
+	return "sensegrid/v1/" + deviceID + "/config"
+}
+
+// StateTopic returns the MQTT topic a device reports its applied shadow
+// state to, and the wildcard cmd/control's shadow.Reconciler subscribes
+// against (sensegrid/v1/+/state).
+func StateTopic(deviceID string) string {
+	return "sensegrid/v1/" + deviceID + "/state"
+}
+
+// DeviceIDFromStateTopic extracts {id} from "sensegrid/v1/{id}/state", for
+// shadow.Reconciler's wildcard subscription.
+func DeviceIDFromStateTopic(topic string) (string, bool) {
+	parts := strings.Split(topic, "/")
+	if len(parts) != 4 || parts[0] != "sensegrid" || parts[1] != "v1" || parts[3] != "state" {
+		return "", false
+	}
+	return parts[2], true
 }
 
 // JetStreamSubject returns the JetStream subject the ingest bridge

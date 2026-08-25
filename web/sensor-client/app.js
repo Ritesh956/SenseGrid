@@ -1,5 +1,6 @@
 import { MQTTClient } from "./mqtt-client.js";
 import { requestMotionPermission, SensorSampler, readBattery, readNetworkType } from "./sensors.js";
+import { defaultConfig, applyPartial, toReported } from "./shadow-config.js";
 
 const STORAGE_KEY = "sensegrid.device.v1";
 const SCHEMA_VERSION = "1.0";
@@ -79,6 +80,9 @@ function initDashboard(device) {
   let sampler = null;
   let mqttClient = null;
   let batteryTimer = null;
+  let cfg = defaultConfig(20); // reseeded from rateInput.value at start()
+  let pending = [];
+  let lastFlush = Date.now();
 
   const rateInput = el("rate-input");
   const permBtn = el("perm-btn");
@@ -95,10 +99,45 @@ function initDashboard(device) {
     if (status === "connected") errorEl.textContent = "";
   }
 
+  // sensorAllowed gates a sensor_type against cfg.enabledSensors — null
+  // means "all enabled" (the pre-Phase-4 default), matching
+  // SensorSampler.setEnabledSensors' own convention for the same field.
+  function sensorAllowed(sensorType) {
+    return !cfg.enabledSensors || cfg.enabledSensors.includes(sensorType);
+  }
+
+  // enqueue either publishes immediately (reporting_mode "continuous",
+  // today's pre-Phase-4 behavior) or buffers and flushes as a burst once
+  // batch_size/flush_interval_ms is hit (see shadow-config.js) — the wire
+  // shape of each individual telemetry message is unchanged either way,
+  // only the timing of when it's sent.
+  function enqueue(payload) {
+    if (cfg.reportingMode !== "batched") {
+      mqttClient.publish(`sensegrid/v1/${device.device_id}/telemetry`, payload);
+      sentCountEl.textContent = mqttClient.stats.sent;
+      queuedCountEl.textContent = mqttClient.stats.queued;
+      return;
+    }
+    pending.push(payload);
+    const sizeHit = cfg.batchSize > 0 && pending.length >= cfg.batchSize;
+    const timeHit = cfg.flushIntervalMs > 0 && Date.now() - lastFlush >= cfg.flushIntervalMs;
+    if (sizeHit || timeHit) flushPending();
+  }
+
+  function flushPending() {
+    for (const payload of pending) {
+      mqttClient.publish(`sensegrid/v1/${device.device_id}/telemetry`, payload);
+    }
+    pending = [];
+    lastFlush = Date.now();
+    sentCountEl.textContent = mqttClient.stats.sent;
+    queuedCountEl.textContent = mqttClient.stats.queued;
+  }
+
   function publishReading(sensorType, values) {
-    if (!mqttClient) return;
+    if (!mqttClient || !sensorAllowed(sensorType)) return;
     seq += 1;
-    const payload = {
+    enqueue({
       schema_version: SCHEMA_VERSION,
       device_id: device.device_id,
       sensor_type: sensorType,
@@ -106,16 +145,13 @@ function initDashboard(device) {
       device_time_ms: Date.now(),
       seq,
       trace_id: randomTraceID(),
-    };
-    mqttClient.publish(`sensegrid/v1/${device.device_id}/telemetry`, payload);
-    sentCountEl.textContent = mqttClient.stats.sent;
-    queuedCountEl.textContent = mqttClient.stats.queued;
+    });
   }
 
   function publishScalar(sensorType, value) {
-    if (!mqttClient || value === null || value === undefined) return;
+    if (!mqttClient || value === null || value === undefined || !sensorAllowed(sensorType)) return;
     seq += 1;
-    mqttClient.publish(`sensegrid/v1/${device.device_id}/telemetry`, {
+    enqueue({
       schema_version: SCHEMA_VERSION,
       device_id: device.device_id,
       sensor_type: sensorType,
@@ -124,6 +160,41 @@ function initDashboard(device) {
       seq,
       trace_id: randomTraceID(),
     });
+  }
+
+  function publishReported(rejected, rejectedRevision, reason) {
+    if (!mqttClient) return;
+    const rep = toReported(cfg, rejected, rejectedRevision, reason);
+    mqttClient.publish(`sensegrid/v1/${device.device_id}/state`, rep);
+  }
+
+  // handleConfigMessage applies (or rejects) an incoming desired-config
+  // message — mirrors cmd/hostagent's configHandler in main.go. Runtime
+  // effects (sample rate, enabled sensors) take effect immediately; the
+  // wire schema and validation rules are shared with hostagent via
+  // internal/shadow's Go types / shadow-config.js's JS mirror.
+  function handleConfigMessage(_topic, payloadBytes) {
+    let desired;
+    try {
+      desired = JSON.parse(new TextDecoder().decode(payloadBytes));
+    } catch (err) {
+      console.error("config: unparseable desired config", err);
+      return;
+    }
+
+    const { next, error } = applyPartial(cfg, desired);
+    if (error) {
+      console.warn("config: rejecting desired config", error);
+      publishReported(true, desired.revision, error);
+      return;
+    }
+
+    cfg = next;
+    if (sampler) {
+      sampler.setRate(cfg.sampleRateHz);
+      sampler.setEnabledSensors(cfg.enabledSensors);
+    }
+    publishReported(false);
   }
 
   async function start() {
@@ -136,16 +207,31 @@ function initDashboard(device) {
     permBtn.hidden = true;
     stopBtn.hidden = false;
     rateInput.disabled = true;
+    cfg = defaultConfig(Number(rateInput.value) || 20);
+    pending = [];
+    lastFlush = Date.now();
 
     mqttClient = new MQTTClient(`wss://${location.hostname}:9001`, {
       clientId: device.device_id,
       username: device.mqtt_username,
       password: device.mqtt_password,
     });
-    mqttClient.onStatusChange = setStatus;
+    mqttClient.onStatusChange = (status, detail) => {
+      setStatus(status, detail);
+      // Subscribing here (not once, right after start()) matches
+      // mqtt-client.js's own resubscribe-on-every-connect behavior: the
+      // very first CONNACK is itself a "connected" status change, so this
+      // covers both the initial connect and every reconnect with the same
+      // code path — no separate "first connect" special case needed.
+      if (status === "connected") {
+        mqttClient.subscribe(`sensegrid/v1/${device.device_id}/config`, 1);
+        publishReported(false);
+      }
+    };
+    mqttClient.onMessage = handleConfigMessage;
     mqttClient.start();
 
-    sampler = new SensorSampler(Number(rateInput.value) || 20, publishReading);
+    sampler = new SensorSampler(cfg.sampleRateHz, publishReading);
     sampler.start();
 
     readNetworkTypeAndPublish();
@@ -166,6 +252,7 @@ function initDashboard(device) {
   function stop() {
     sending = false;
     if (sampler) sampler.stop();
+    if (pending.length && mqttClient) flushPending(); // don't lose a partial batch on stop
     if (mqttClient) mqttClient.stop();
     clearInterval(batteryTimer);
     permBtn.hidden = false;

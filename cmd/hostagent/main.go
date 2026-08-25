@@ -19,6 +19,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -28,6 +29,7 @@ import (
 	"github.com/Ritesh956/SenseGrid/internal/httpserver"
 	"github.com/Ritesh956/SenseGrid/internal/logging"
 	"github.com/Ritesh956/SenseGrid/internal/provisioning"
+	"github.com/Ritesh956/SenseGrid/internal/shadow"
 	"github.com/Ritesh956/SenseGrid/internal/telemetry"
 	"github.com/Ritesh956/SenseGrid/internal/tlsutil"
 )
@@ -59,15 +61,19 @@ func main() {
 	}
 	logger.Info("provisioned", "device_id", creds.DeviceID, "name", creds.Name)
 
-	mqttClient, err := connectMQTT(cfg, creds, caFile, logger)
+	sampleInterval := getEnvDuration("HOSTAGENT_SAMPLE_INTERVAL", 5*time.Second)
+	cfgState := &atomic.Pointer[appliedConfig]{}
+	cfgState.Store(ptr(defaultAppliedConfig(int(sampleInterval.Milliseconds()))))
+	intervalChanged := make(chan int, 1)
+
+	mqttClient, err := connectMQTT(cfg, creds, caFile, logger, cfgState, intervalChanged)
 	if err != nil {
 		logger.Error("mqtt connect failed", "err", err)
 		os.Exit(1)
 	}
 	defer mqttClient.Disconnect(250)
 
-	sampleInterval := getEnvDuration("HOSTAGENT_SAMPLE_INTERVAL", 5*time.Second)
-	go runSamplingLoop(ctx, mqttClient, creds.DeviceID, sampleInterval, logger)
+	go runSamplingLoop(ctx, mqttClient, creds.DeviceID, cfgState, intervalChanged, logger)
 
 	srv, _ := httpserver.New(cfg.HTTPAddr)
 	if err := httpserver.Run(ctx, srv, cfg.ShutdownTimeout, cfg.HTTPTLSCertFile, cfg.HTTPTLSKeyFile, logger); err != nil {
@@ -77,15 +83,17 @@ func main() {
 	logger.Info("shutdown complete")
 }
 
-func connectMQTT(cfg config.Config, creds provisioning.Credentials, caFile string, logger *slog.Logger) (mqtt.Client, error) {
+func connectMQTT(cfg config.Config, creds provisioning.Credentials, caFile string, logger *slog.Logger,
+	cfgState *atomic.Pointer[appliedConfig], intervalChanged chan<- int) (mqtt.Client, error) {
 	tlsCfg, err := tlsutil.FromCAFile(caFile)
 	if err != nil {
 		return nil, fmt.Errorf("loading CA: %w", err)
 	}
 
+	deviceID := creds.DeviceID
 	opts := mqtt.NewClientOptions().
 		AddBroker(cfg.MQTTBrokerURL).
-		SetClientID(creds.DeviceID).
+		SetClientID(deviceID).
 		SetUsername(creds.MQTTUsername).
 		SetPassword(creds.MQTTPassword).
 		SetTLSConfig(tlsCfg).
@@ -93,12 +101,28 @@ func connectMQTT(cfg config.Config, creds provisioning.Credentials, caFile strin
 		SetAutoReconnect(true).
 		SetConnectRetryInterval(2 * time.Second).
 		SetMaxReconnectInterval(30 * time.Second).
-		SetOnConnectHandler(func(mqtt.Client) {
-			logger.Info("mqtt connected")
-		}).
 		SetConnectionLostHandler(func(_ mqtt.Client, err error) {
 			logger.Warn("mqtt connection lost, reconnecting with backoff", "err", err)
 		})
+
+	// SetOnConnectHandler, not a one-time Subscribe after Connect returns:
+	// paho doesn't automatically resubscribe on reconnect (clean sessions
+	// by default), so re-subscribing here is what makes "disconnect,
+	// change config, reconnect — picks it up immediately" work rather than
+	// only working on the very first connect.
+	opts.SetOnConnectHandler(func(c mqtt.Client) {
+		logger.Info("mqtt connected")
+		token := c.Subscribe(telemetry.ConfigTopic(deviceID), 1, configHandler(deviceID, cfgState, intervalChanged, c, logger))
+		if !token.WaitTimeout(10 * time.Second) {
+			logger.Error("subscribing to config topic timed out")
+			return
+		}
+		if err := token.Error(); err != nil {
+			logger.Error("subscribing to config topic failed", "err", err)
+			return
+		}
+		publishReported(c, deviceID, *cfgState.Load(), logger)
+	})
 
 	client := mqtt.NewClient(opts)
 	token := client.Connect()
@@ -111,25 +135,101 @@ func connectMQTT(cfg config.Config, creds provisioning.Credentials, caFile strin
 	return client, nil
 }
 
-func runSamplingLoop(ctx context.Context, client mqtt.Client, deviceID string, interval time.Duration, logger *slog.Logger) {
+// configHandler applies (or rejects) an incoming desired-config message —
+// see config.go's applyPartial for validation — swaps cfgState, nudges the
+// sampling loop to pick up a new interval immediately rather than waiting
+// out the old ticker, and reports back what actually took effect.
+func configHandler(deviceID string, cfgState *atomic.Pointer[appliedConfig], intervalChanged chan<- int, client mqtt.Client, logger *slog.Logger) mqtt.MessageHandler {
+	return func(c mqtt.Client, msg mqtt.Message) {
+		var d shadow.Desired
+		if err := json.Unmarshal(msg.Payload(), &d); err != nil {
+			logger.Error("config: unparseable desired config, ignoring", "err", err)
+			return
+		}
+
+		current := *cfgState.Load()
+		next, err := applyPartial(current, d)
+		if err != nil {
+			logger.Warn("config: rejecting desired config", "err", err, "revision", d.Revision)
+			publishReportedValue(client, deviceID, current.toRejectedReported(d.Revision, err.Error()), logger)
+			return
+		}
+
+		cfgState.Store(&next)
+		select {
+		case intervalChanged <- next.sampleIntervalMS:
+		default:
+		}
+		logger.Info("config: applied desired config", "revision", d.Revision, "sample_interval_ms", next.sampleIntervalMS)
+		publishReported(client, deviceID, next, logger)
+	}
+}
+
+func publishReported(client mqtt.Client, deviceID string, cfg appliedConfig, logger *slog.Logger) {
+	publishReportedValue(client, deviceID, cfg.toReported(), logger)
+}
+
+func publishReportedValue(client mqtt.Client, deviceID string, rep shadow.Reported, logger *slog.Logger) {
+	rep.ReportedAtMS = time.Now().UnixMilli()
+	body, err := json.Marshal(rep)
+	if err != nil {
+		logger.Error("config: marshaling reported state", "err", err)
+		return
+	}
+	client.Publish(telemetry.StateTopic(deviceID), 0, false, body)
+}
+
+func ptr[T any](v T) *T { return &v }
+
+// runSamplingLoop ticks at the current config's sample interval,
+// collecting and publishing readings — continuously (today's behavior,
+// one publish per reading) or batched (buffered and sent as a burst),
+// depending on the shared appliedConfig. intervalChanged lets
+// configHandler shrink/grow the ticker immediately on a config update
+// rather than waiting for the current tick to fire on the old interval.
+func runSamplingLoop(ctx context.Context, client mqtt.Client, deviceID string, cfgState *atomic.Pointer[appliedConfig], intervalChanged <-chan int, logger *slog.Logger) {
 	var seq uint64
 	warnOnce := map[string]bool{}
 	topic := telemetry.TelemetryTopic(deviceID)
 
-	ticker := time.NewTicker(interval)
+	cfg := *cfgState.Load()
+	ticker := time.NewTicker(time.Duration(cfg.sampleIntervalMS) * time.Millisecond)
 	defer ticker.Stop()
+
+	var pending []telemetry.Reading
+	lastFlush := time.Now()
+
+	flush := func() {
+		for _, payload := range pending {
+			body, err := json.Marshal(payload)
+			if err != nil {
+				logger.Error("marshal reading", "err", err, "sensor_type", payload.SensorType)
+				continue
+			}
+			client.Publish(topic, 1, false, body)
+		}
+		pending = pending[:0]
+		lastFlush = time.Now()
+	}
 
 	for {
 		select {
 		case <-ctx.Done():
+			flush()
 			return
+		case ms := <-intervalChanged:
+			ticker.Reset(time.Duration(ms) * time.Millisecond)
 		case <-ticker.C:
+			cfg = *cfgState.Load()
 			if !client.IsConnected() {
 				continue // dropped, not queued: the next tick tries again
 			}
 			for _, r := range collect(ctx, logger, warnOnce) {
+				if !cfg.sensorEnabled(r.sensorType) {
+					continue
+				}
 				seq++
-				payload := telemetry.Reading{
+				pending = append(pending, telemetry.Reading{
 					SchemaVersion: telemetry.SchemaVersion,
 					DeviceID:      deviceID,
 					SensorType:    r.sensorType,
@@ -138,13 +238,17 @@ func runSamplingLoop(ctx context.Context, client mqtt.Client, deviceID string, i
 					DeviceTimeMS:  time.Now().UnixMilli(),
 					Seq:           seq,
 					TraceID:       telemetry.NewTraceID(),
-				}
-				body, err := json.Marshal(payload)
-				if err != nil {
-					logger.Error("marshal reading", "err", err, "sensor_type", r.sensorType)
-					continue
-				}
-				client.Publish(topic, 1, false, body)
+				})
+			}
+
+			if cfg.mode != shadow.ReportingBatched {
+				flush()
+				continue
+			}
+			sizeHit := cfg.batchSize > 0 && len(pending) >= cfg.batchSize
+			timeHit := cfg.flushIntervalMS > 0 && time.Since(lastFlush) >= time.Duration(cfg.flushIntervalMS)*time.Millisecond
+			if sizeHit || timeHit {
+				flush()
 			}
 		}
 	}

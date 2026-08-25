@@ -22,16 +22,32 @@ type Config struct {
 	HTTPTLSKeyFile  string
 	ShutdownTimeout time.Duration
 
-	MQTTBrokerURL  string
-	MQTTAdminUser  string
-	MQTTAdminPass  string
-	MQTTBridgeUser string
-	MQTTBridgePass string
-	NATSURL        string
-	PostgresDSN    string
-	RedisAddr      string
-	TLSCAFile      string
-	OTLPEndpoint   string
+	MQTTBrokerURL   string
+	MQTTAdminUser   string
+	MQTTAdminPass   string
+	MQTTBridgeUser  string
+	MQTTBridgePass  string
+	MQTTControlUser string
+	MQTTControlPass string
+	NATSURL         string
+	PostgresDSN     string
+	RedisAddr       string
+	TLSCAFile       string
+	OTLPEndpoint    string
+
+	// JWT settings — cmd/control (Phase 4). No login endpoint exists yet
+	// (see internal/config's sibling doc in cmd/control/jwt_cli.go); tokens
+	// are minted by the `control jwt create` CLI using this same signing
+	// key, so the running server and the CLI must read it from the same
+	// place, which Load already guarantees.
+	JWTSigningKey string
+	JWTIssuer     string
+	JWTAccessTTL  time.Duration
+
+	// DriftStaleAfter is how long a device can go without a state report
+	// before GET /v1/devices/drift considers it drifted even if its last
+	// applied_revision matched — see internal/shadow.Drift.
+	DriftStaleAfter time.Duration
 
 	RulesFile           string
 	RulesReloadInterval time.Duration
@@ -60,16 +76,24 @@ func Load(serviceName, defaultHTTPAddr string) Config {
 		HTTPTLSKeyFile:  getEnv("HTTP_TLS_KEY_FILE", ""),
 		ShutdownTimeout: getDuration("SHUTDOWN_TIMEOUT", 10*time.Second),
 
-		MQTTBrokerURL:  getEnv("MQTT_BROKER_URL", "tls://localhost:8883"),
-		MQTTAdminUser:  getEnv("MQTT_ADMIN_USERNAME", ""),
-		MQTTAdminPass:  getEnv("MQTT_ADMIN_PASSWORD", ""),
-		MQTTBridgeUser: getEnv("MQTT_BRIDGE_USERNAME", "ingest-bridge"),
-		MQTTBridgePass: getEnv("MQTT_BRIDGE_PASSWORD", ""),
-		NATSURL:        getEnv("NATS_URL", "nats://localhost:4222"),
-		PostgresDSN:    getEnv("POSTGRES_DSN", "postgres://sensegrid:sensegrid@localhost:5432/sensegrid?sslmode=disable"),
-		RedisAddr:      getEnv("REDIS_ADDR", "localhost:6379"),
-		TLSCAFile:      getEnv("TLS_CA_FILE", ""),
-		OTLPEndpoint:   getEnv("OTEL_EXPORTER_OTLP_ENDPOINT", ""),
+		MQTTBrokerURL:   getEnv("MQTT_BROKER_URL", "tls://localhost:8883"),
+		MQTTAdminUser:   getEnv("MQTT_ADMIN_USERNAME", ""),
+		MQTTAdminPass:   getEnv("MQTT_ADMIN_PASSWORD", ""),
+		MQTTBridgeUser:  getEnv("MQTT_BRIDGE_USERNAME", "ingest-bridge"),
+		MQTTBridgePass:  getEnv("MQTT_BRIDGE_PASSWORD", ""),
+		MQTTControlUser: getEnv("MQTT_CONTROL_USERNAME", "control-plane"),
+		MQTTControlPass: getEnv("MQTT_CONTROL_PASSWORD", ""),
+		NATSURL:         getEnv("NATS_URL", "nats://localhost:4222"),
+		PostgresDSN:     getEnv("POSTGRES_DSN", "postgres://sensegrid:sensegrid@localhost:5432/sensegrid?sslmode=disable"),
+		RedisAddr:       getEnv("REDIS_ADDR", "localhost:6379"),
+		TLSCAFile:       getEnv("TLS_CA_FILE", ""),
+		OTLPEndpoint:    getEnv("OTEL_EXPORTER_OTLP_ENDPOINT", ""),
+
+		JWTSigningKey: getEnv("JWT_SIGNING_KEY", ""),
+		JWTIssuer:     getEnv("JWT_ISSUER", "sensegrid-control"),
+		JWTAccessTTL:  getDuration("JWT_ACCESS_TTL", 15*time.Minute),
+
+		DriftStaleAfter: getDuration("SHADOW_DRIFT_STALE_AFTER", 2*time.Minute),
 
 		RulesFile:           getEnv("RULES_FILE", "deploy/rules.yaml"),
 		RulesReloadInterval: getDuration("RULES_RELOAD_INTERVAL", 5*time.Second),
@@ -93,12 +117,14 @@ func (c Config) LogValue() slog.Value {
 		slog.String("mqtt_broker_url", c.MQTTBrokerURL),
 		slog.Bool("mqtt_admin_configured", c.MQTTAdminUser != "" && c.MQTTAdminPass != ""),
 		slog.Bool("mqtt_bridge_configured", c.MQTTBridgeUser != "" && c.MQTTBridgePass != ""),
+		slog.Bool("mqtt_control_configured", c.MQTTControlUser != "" && c.MQTTControlPass != ""),
 		slog.String("nats_url", c.NATSURL),
 		slog.String("redis_addr", c.RedisAddr),
 		slog.Bool("postgres_dsn_set", c.PostgresDSN != ""),
 		slog.Bool("tls_ca_file_set", c.TLSCAFile != ""),
 		slog.Bool("otlp_endpoint_set", c.OTLPEndpoint != ""),
 		slog.String("rules_file", c.RulesFile),
+		slog.Bool("jwt_signing_key_set", c.JWTSigningKey != ""),
 	)
 }
 
