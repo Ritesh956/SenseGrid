@@ -8,11 +8,22 @@ package telemetry
 
 import (
 	"encoding/hex"
+	"errors"
+	"fmt"
 
 	"github.com/google/uuid"
 )
 
 const SchemaVersion = "1.0"
+
+// JetStream stream/subject names, shared by cmd/ingest (which creates the
+// streams and publishes) and cmd/processor (which consumes them) so the
+// naming lives in exactly one place.
+const (
+	TelemetryStreamName = "TELEMETRY"
+	DLQStreamName       = "DLQ"
+	DLQSubject          = "dlq.telemetry"
+)
 
 // Reading is one sensor sample. Use Value for a scalar reading (e.g. CPU
 // percent) or Values for a vector reading (e.g. accelerometer x/y/z);
@@ -28,9 +39,53 @@ type Reading struct {
 	TraceID       string             `json:"trace_id"`
 }
 
+// Validate reports whether r is well-formed enough to persist. It does not
+// check that DeviceID matches the MQTT topic it arrived on — the caller
+// (cmd/ingest) does that separately, since Validate has no notion of the
+// topic a reading came in on.
+func (r Reading) Validate() error {
+	if r.SchemaVersion != SchemaVersion {
+		return fmt.Errorf("unsupported schema_version %q", r.SchemaVersion)
+	}
+	if _, err := uuid.Parse(r.DeviceID); err != nil {
+		return fmt.Errorf("invalid device_id: %w", err)
+	}
+	if r.SensorType == "" {
+		return errors.New("sensor_type is required")
+	}
+	if r.Value == nil && r.Values == nil {
+		return errors.New("exactly one of value or values must be set")
+	}
+	if r.Value != nil && r.Values != nil {
+		return errors.New("exactly one of value or values must be set, not both")
+	}
+	if r.DeviceTimeMS <= 0 {
+		return errors.New("device_time_ms must be a positive epoch-millisecond timestamp")
+	}
+	if len(r.TraceID) != 32 {
+		return errors.New("trace_id must be 32 hex characters")
+	}
+	return nil
+}
+
+// StampedReading is what the ingest bridge publishes to JetStream: a
+// Reading plus the broker-receive timestamp, so the persistence consumer
+// has both device_time and ingest_time without a second lookup.
+type StampedReading struct {
+	Reading
+	IngestTimeMS int64 `json:"ingest_time_ms"`
+}
+
 // TelemetryTopic returns the MQTT topic a device publishes readings to.
 func TelemetryTopic(deviceID string) string {
 	return "sensegrid/v1/" + deviceID + "/telemetry"
+}
+
+// JetStreamSubject returns the JetStream subject the ingest bridge
+// publishes a device's readings to, and the persistence consumer's
+// filter subject reads from.
+func JetStreamSubject(deviceID string) string {
+	return "telemetry." + deviceID
 }
 
 // NewTraceID returns a W3C trace-id shaped correlation id: 32 lowercase

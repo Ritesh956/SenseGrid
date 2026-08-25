@@ -14,16 +14,21 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgxpool"
+
 	"github.com/Ritesh956/SenseGrid/internal/config"
+	"github.com/Ritesh956/SenseGrid/internal/devices"
 	"github.com/Ritesh956/SenseGrid/internal/devicestore"
 	"github.com/Ritesh956/SenseGrid/internal/dynsec"
 	"github.com/Ritesh956/SenseGrid/internal/httpserver"
 	"github.com/Ritesh956/SenseGrid/internal/logging"
+	"github.com/Ritesh956/SenseGrid/internal/migrations"
 )
 
 const (
 	defaultHTTPAddr = ":8080"
 	deviceRoleName  = "device"
+	bridgeRoleName  = "bridge"
 )
 
 func main() {
@@ -45,8 +50,29 @@ func runServer() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
 	defer stop()
 
-	store := devicestore.New(cfg.RedisAddr)
-	defer store.Close()
+	tokens := devicestore.New(cfg.RedisAddr)
+	defer tokens.Close()
+
+	pool, err := pgxpool.New(ctx, cfg.PostgresDSN)
+	if err != nil {
+		logger.Error("postgres: connecting", "err", err)
+		os.Exit(1)
+	}
+	defer pool.Close()
+
+	migrationsDir := os.Getenv("MIGRATIONS_DIR")
+	if migrationsDir == "" {
+		migrationsDir = "deploy/migrations"
+	}
+	migrateCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	err = migrations.Run(migrateCtx, pool, migrationsDir)
+	cancel()
+	if err != nil {
+		logger.Error("postgres: applying migrations", "err", err, "dir", migrationsDir)
+		os.Exit(1)
+	}
+	logger.Info("postgres: migrations up to date")
+	deviceStore := devices.New(pool)
 
 	dynsecClient := connectDynsec(ctx, cfg, logger)
 	if dynsecClient != nil {
@@ -54,7 +80,7 @@ func runServer() {
 	}
 
 	srv, mux := httpserver.New(cfg.HTTPAddr)
-	registerClaimHandler(mux, logger, store, dynsecClient)
+	registerClaimHandler(mux, logger, tokens, deviceStore, dynsecClient)
 	registerStaticFiles(mux)
 
 	if err := httpserver.Run(ctx, srv, cfg.ShutdownTimeout, cfg.HTTPTLSCertFile, cfg.HTTPTLSKeyFile, logger); err != nil {
@@ -65,10 +91,17 @@ func runServer() {
 }
 
 // connectDynsec connects to the broker's dynamic-security control channel
-// as admin and ensures the shared "device" role exists. A failure here is
-// logged, not fatal: /healthz still succeeds so the container isn't killed
-// over a broker hiccup, but the claim endpoint returns 503 until it
-// recovers (see claim.go).
+// as admin and ensures the shared "device" role exists, plus the "bridge"
+// role and cmd/ingest's own service account (a device is scoped to its own
+// topic via %c substitution; the ingest bridge instead needs to subscribe
+// across every device's telemetry, which needs its own role and its own
+// long-lived credential — see deploy/docker-compose.yml's MQTT_BRIDGE_*
+// vars, shared between control, which provisions this account, and
+// ingest, which connects as it).
+//
+// A failure here is logged, not fatal: /healthz still succeeds so the
+// container isn't killed over a broker hiccup, but the claim endpoint
+// returns 503 until it recovers (see claim.go).
 func connectDynsec(ctx context.Context, cfg config.Config, logger *slog.Logger) *dynsec.Client {
 	if cfg.MQTTAdminUser == "" || cfg.MQTTAdminPass == "" {
 		logger.Warn("MQTT_ADMIN_USERNAME/MQTT_ADMIN_PASSWORD not set, device claim endpoint will stay disabled")
@@ -87,6 +120,7 @@ func connectDynsec(ctx context.Context, cfg config.Config, logger *slog.Logger) 
 
 	bootstrapCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
 	defer cancel()
+
 	if err := client.EnsureRole(bootstrapCtx, deviceRoleName, "SenseGrid provisioned device", []dynsec.ACL{
 		{ACLType: "publishClientSend", Topic: "sensegrid/v1/%c/telemetry", Priority: -1, Allow: true},
 		{ACLType: "publishClientSend", Topic: "sensegrid/v1/%c/state", Priority: -1, Allow: true},
@@ -98,6 +132,27 @@ func connectDynsec(ctx context.Context, cfg config.Config, logger *slog.Logger) 
 		return nil
 	}
 	logger.Info("dynsec: device role ready")
+
+	if cfg.MQTTBridgeUser == "" || cfg.MQTTBridgePass == "" {
+		logger.Warn("MQTT_BRIDGE_USERNAME/MQTT_BRIDGE_PASSWORD not set, skipping bridge role/account bootstrap")
+		return client
+	}
+	// subscribeLiteral, not subscribePattern: the bridge subscribes with
+	// the exact wildcard filter below (a fixed string, no %c to
+	// substitute), so a literal match of that filter is both correct and
+	// simpler than pattern matching.
+	if err := client.EnsureRole(bootstrapCtx, bridgeRoleName, "SenseGrid ingest bridge", []dynsec.ACL{
+		{ACLType: "subscribeLiteral", Topic: "sensegrid/v1/+/telemetry", Priority: -1, Allow: true},
+		{ACLType: "publishClientReceive", Topic: "sensegrid/v1/+/telemetry", Priority: -1, Allow: true},
+	}); err != nil {
+		logger.Error("dynsec: bootstrap bridge role failed", "err", err)
+		return client
+	}
+	if err := client.CreateClient(bootstrapCtx, cfg.MQTTBridgeUser, cfg.MQTTBridgePass, "ingest bridge service account", bridgeRoleName); err != nil {
+		logger.Error("dynsec: bootstrap bridge account failed", "err", err)
+		return client
+	}
+	logger.Info("dynsec: bridge role and account ready")
 	return client
 }
 

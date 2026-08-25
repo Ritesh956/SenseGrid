@@ -22,13 +22,16 @@ type Config struct {
 	HTTPTLSKeyFile  string
 	ShutdownTimeout time.Duration
 
-	MQTTBrokerURL string
-	MQTTAdminUser string
-	MQTTAdminPass string
-	NATSURL       string
-	PostgresDSN   string
-	RedisAddr     string
-	TLSCAFile     string
+	MQTTBrokerURL  string
+	MQTTAdminUser  string
+	MQTTAdminPass  string
+	MQTTBridgeUser string
+	MQTTBridgePass string
+	NATSURL        string
+	PostgresDSN    string
+	RedisAddr      string
+	TLSCAFile      string
+	OTLPEndpoint   string
 }
 
 // Load builds a Config for serviceName, using defaultHTTPAddr when HTTP_ADDR
@@ -44,13 +47,16 @@ func Load(serviceName, defaultHTTPAddr string) Config {
 		HTTPTLSKeyFile:  getEnv("HTTP_TLS_KEY_FILE", ""),
 		ShutdownTimeout: getDuration("SHUTDOWN_TIMEOUT", 10*time.Second),
 
-		MQTTBrokerURL: getEnv("MQTT_BROKER_URL", "tls://localhost:8883"),
-		MQTTAdminUser: getEnv("MQTT_ADMIN_USERNAME", ""),
-		MQTTAdminPass: getEnv("MQTT_ADMIN_PASSWORD", ""),
-		NATSURL:       getEnv("NATS_URL", "nats://localhost:4222"),
-		PostgresDSN:   getEnv("POSTGRES_DSN", "postgres://sensegrid:sensegrid@localhost:5432/sensegrid?sslmode=disable"),
-		RedisAddr:     getEnv("REDIS_ADDR", "localhost:6379"),
-		TLSCAFile:     getEnv("TLS_CA_FILE", ""),
+		MQTTBrokerURL:  getEnv("MQTT_BROKER_URL", "tls://localhost:8883"),
+		MQTTAdminUser:  getEnv("MQTT_ADMIN_USERNAME", ""),
+		MQTTAdminPass:  getEnv("MQTT_ADMIN_PASSWORD", ""),
+		MQTTBridgeUser: getEnv("MQTT_BRIDGE_USERNAME", "ingest-bridge"),
+		MQTTBridgePass: getEnv("MQTT_BRIDGE_PASSWORD", ""),
+		NATSURL:        getEnv("NATS_URL", "nats://localhost:4222"),
+		PostgresDSN:    getEnv("POSTGRES_DSN", "postgres://sensegrid:sensegrid@localhost:5432/sensegrid?sslmode=disable"),
+		RedisAddr:      getEnv("REDIS_ADDR", "localhost:6379"),
+		TLSCAFile:      getEnv("TLS_CA_FILE", ""),
+		OTLPEndpoint:   getEnv("OTEL_EXPORTER_OTLP_ENDPOINT", ""),
 	}
 }
 
@@ -64,10 +70,12 @@ func (c Config) LogValue() slog.Value {
 		slog.Bool("http_tls_enabled", c.HTTPTLSCertFile != "" && c.HTTPTLSKeyFile != ""),
 		slog.String("mqtt_broker_url", c.MQTTBrokerURL),
 		slog.Bool("mqtt_admin_configured", c.MQTTAdminUser != "" && c.MQTTAdminPass != ""),
+		slog.Bool("mqtt_bridge_configured", c.MQTTBridgeUser != "" && c.MQTTBridgePass != ""),
 		slog.String("nats_url", c.NATSURL),
 		slog.String("redis_addr", c.RedisAddr),
 		slog.Bool("postgres_dsn_set", c.PostgresDSN != ""),
 		slog.Bool("tls_ca_file_set", c.TLSCAFile != ""),
+		slog.Bool("otlp_endpoint_set", c.OTLPEndpoint != ""),
 	)
 }
 

@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/Ritesh956/SenseGrid/internal/devices"
 	"github.com/Ritesh956/SenseGrid/internal/devicestore"
 	"github.com/Ritesh956/SenseGrid/internal/dynsec"
 	"github.com/google/uuid"
@@ -38,7 +39,7 @@ type claimResponse struct {
 // scoped to exactly one device_id. Deliberately unauthenticated beyond the
 // token itself — the whole point is that the device doesn't have
 // credentials yet.
-func registerClaimHandler(mux *http.ServeMux, logger *slog.Logger, store *devicestore.Store, dynsecClient *dynsec.Client) {
+func registerClaimHandler(mux *http.ServeMux, logger *slog.Logger, tokens *devicestore.Store, deviceStore *devices.Store, dynsecClient *dynsec.Client) {
 	mux.HandleFunc("POST /v1/devices/claim", func(w http.ResponseWriter, r *http.Request) {
 		if dynsecClient == nil {
 			writeJSONError(w, http.StatusServiceUnavailable, "device provisioning is temporarily unavailable")
@@ -62,7 +63,7 @@ func registerClaimHandler(mux *http.ServeMux, logger *slog.Logger, store *device
 		ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
 		defer cancel()
 
-		rec, err := store.ConsumeToken(ctx, req.Token)
+		rec, err := tokens.ConsumeToken(ctx, req.Token)
 		if errors.Is(err, devicestore.ErrTokenNotFound) {
 			writeJSONError(w, http.StatusUnauthorized, "invalid or expired token")
 			return
@@ -80,22 +81,23 @@ func registerClaimHandler(mux *http.ServeMux, logger *slog.Logger, store *device
 			return
 		}
 
+		// Devices row is created before the broker credential, deliberately:
+		// if dynsec provisioning then fails, we're left with an inert,
+		// never-authenticatable device_id (harmless — the client generates a
+		// fresh id on its next attempt). The other order is worse: a device
+		// that can authenticate and publish but has no devices row would
+		// have every reading rejected by the readings.device_id foreign key,
+		// silently, downstream, in a completely different service.
+		if err := deviceStore.Create(ctx, req.DeviceID, rec.Name, rec.Type); err != nil {
+			logger.Error("claim: create device record", "err", err, "device_id", req.DeviceID)
+			writeJSONError(w, http.StatusInternalServerError, "internal error")
+			return
+		}
+
 		if err := dynsecClient.CreateClient(ctx, req.DeviceID, password, rec.Name, deviceRoleName); err != nil {
 			logger.Error("claim: provision broker credential", "err", err, "device_id", req.DeviceID)
 			writeJSONError(w, http.StatusInternalServerError, "failed to provision broker credentials")
 			return
-		}
-
-		if err := store.SaveDevice(ctx, devicestore.Device{
-			DeviceID:  req.DeviceID,
-			Name:      rec.Name,
-			Type:      rec.Type,
-			ClaimedAt: time.Now().UTC(),
-		}); err != nil {
-			// Broker credentials are already provisioned; don't fail the
-			// claim over a bookkeeping write the device doesn't need to
-			// proceed. Phase 2 replaces this store with TimescaleDB anyway.
-			logger.Error("claim: save device record", "err", err, "device_id", req.DeviceID)
 		}
 
 		resp := claimResponse{

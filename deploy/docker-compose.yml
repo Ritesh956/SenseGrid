@@ -18,10 +18,13 @@ x-go-service: &go-service
     SENSEGRID_ENV: ${SENSEGRID_ENV:-dev}
     LOG_LEVEL: ${LOG_LEVEL:-info}
     MQTT_BROKER_URL: ${MQTT_BROKER_URL:-tls://mosquitto:8883}
+    MQTT_BRIDGE_USERNAME: ${MQTT_BRIDGE_USERNAME:-ingest-bridge}
+    MQTT_BRIDGE_PASSWORD: ${MQTT_BRIDGE_PASSWORD:?set MQTT_BRIDGE_PASSWORD in .env}
     NATS_URL: ${NATS_URL:-nats://nats:4222}
     POSTGRES_DSN: postgres://${POSTGRES_USER:-sensegrid}:${POSTGRES_PASSWORD:-sensegrid-dev}@timescaledb:5432/${POSTGRES_DB:-sensegrid}?sslmode=verify-ca&sslrootcert=/certs/ca.pem
     REDIS_ADDR: ${REDIS_ADDR:-redis:6379}
     TLS_CA_FILE: ${TLS_CA_FILE:-/certs/ca.pem}
+    OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-jaeger:4317}
 
 services:
   mosquitto:
@@ -98,6 +101,21 @@ services:
       retries: 5
       start_period: 5s
 
+  jaeger:
+    # All-in-one Jaeger accepts OTLP directly (gRPC on 4317), which is
+    # enough to satisfy Phase 2's DoD — pull a reading's trace by
+    # trace_id — without standing up a separate OTel Collector in front of
+    # it. A standalone collector earns its place once something needs
+    # collector-side sampling or fan-out to more than one backend, which
+    # is a Phase 6+ concern, not this one.
+    image: jaegertracing/all-in-one:latest
+    networks: [sensegrid]
+    environment:
+      COLLECTOR_OTLP_ENABLED: "true"
+    ports:
+      - "16686:16686" # trace query UI
+      - "4317:4317" # OTLP gRPC
+
   # --- Go services -----------------------------------------------------
   # hostagent is deliberately not a compose service: it exists to read the
   # *host* machine's real CPU/battery/WiFi metrics (Phase 1), which a
@@ -125,9 +143,7 @@ services:
     <<: *go-service
     build:
       context: ..
-      dockerfile: deploy/docker/go.Dockerfile
-      args:
-        SERVICE: processor
+      dockerfile: deploy/docker/processor.Dockerfile
     environment:
       <<: *go-env
       HTTP_ADDR: ":8082"

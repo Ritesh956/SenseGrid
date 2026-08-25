@@ -1,8 +1,8 @@
-// Package devicestore is a Redis-backed store for registration tokens and
-// claimed device records. It is a deliberate placeholder: Phase 2 moves the
-// device registry into TimescaleDB (the devices table) as the system of
-// record, at which point this package's device-record half goes away and
-// only the short-lived, naturally TTL'd registration tokens stay in Redis.
+// Package devicestore is a Redis-backed store for one-time device
+// registration tokens. It used to also hold claimed device records; as of
+// Phase 2 those live in Postgres (internal/devices) as the system of
+// record, and this package is left with exactly the part Redis was
+// actually the right fit for — short-lived, naturally-TTL'd tokens.
 package devicestore
 
 import (
@@ -25,14 +25,6 @@ var ErrTokenNotFound = errors.New("devicestore: registration token not found or 
 type TokenRecord struct {
 	Name string `json:"name"`
 	Type string `json:"type"`
-}
-
-// Device is a provisioned device's record.
-type Device struct {
-	DeviceID  string    `json:"device_id"`
-	Name      string    `json:"name"`
-	Type      string    `json:"type"`
-	ClaimedAt time.Time `json:"claimed_at"`
 }
 
 type Store struct {
@@ -85,20 +77,7 @@ func (s *Store) ConsumeToken(ctx context.Context, token string) (TokenRecord, er
 	return rec, nil
 }
 
-// SaveDevice records a newly claimed device.
-func (s *Store) SaveDevice(ctx context.Context, d Device) error {
-	raw, err := json.Marshal(d)
-	if err != nil {
-		return err
-	}
-	if err := s.rdb.Set(ctx, deviceKey(d.DeviceID), raw, 0).Err(); err != nil {
-		return fmt.Errorf("devicestore: saving device: %w", err)
-	}
-	return nil
-}
-
 func tokenKey(token string) string { return "sensegrid:regtoken:" + token }
-func deviceKey(id string) string   { return "sensegrid:device:" + id }
 
 func randomToken() (string, error) {
 	b := make([]byte, 20)
