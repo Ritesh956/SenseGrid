@@ -10,10 +10,10 @@ and a laptop host agent flows through MQTT → NATS JetStream → TimescaleDB, w
 provisions devices and (from Phase 4 on) pushes config back down to them. Synthetic load only enters
 via `cmd/fleet` (Phase 7), not the primary data path — the phone and laptop are real hardware.
 
-**Current status: Phases 0–2 tagged** (`v0.1-phase0`, `v0.2-phase1`, `v0.3-phase2`); **Phase 3
-(windowed stream processing + anomaly detection) is implemented, not yet tagged** — see
-`internal/window`, `internal/rules`, `internal/anomaly`, `internal/alerts`, and `cmd/processor`'s
-second durable consumer (`windowed.go`). Phase 4 (control plane & device shadow) is next. See "Phase
+**Current status: Phases 0–3 tagged** (`v0.1-phase0`, `v0.2-phase1`, `v0.3-phase2`, `v0.4-phase3`).
+Phase 3 (windowed stream processing + anomaly detection) added `internal/window`, `internal/rules`,
+`internal/anomaly`, `internal/alerts`, and `cmd/processor`'s second durable consumer (`windowed.go`).
+Phase 4 (control plane & device shadow) is next. See "Phase
 status" below before assuming something isn't built yet — check git tags and `internal/` first.
 
 ## Commands
@@ -215,7 +215,7 @@ These cost real time to find once; don't rediscover them.
 | 0 — Foundations | `v0.1-phase0` | Repo scaffold, 5 service skeletons (`/healthz`, graceful shutdown, structured logging), TLS-enabled compose stack (dev CA, TLS on Mosquitto + TimescaleDB). |
 | 1 — Edge clients & provisioning | `v0.2-phase1` | PWA sensor client (hand-rolled MQTT-over-WS, no MQTT.js dependency), device claim flow, Mosquitto dynamic-security auth, `cmd/hostagent` real CPU/mem/battery/WiFi metrics. |
 | 2 — Ingest, persistence, tracing | `v0.3-phase2` | `cmd/ingest` bridge, `cmd/processor` batched persistence, TimescaleDB schema + continuous aggregates + compression/retention, OTel tracing to Jaeger, Prometheus histograms (exposed, not yet scraped — that's Phase 6). |
-| 3 — Stream processing & anomaly detection | *(implemented, untagged)* | `internal/window` (Welford's incremental mean/variance + EWMA, count/age-bound sliding window per device/sensor), `internal/rules` (hot-reloadable YAML, `deploy/rules.yaml`), `internal/anomaly` (z-score/rate-of-change/silence detectors with M-consecutive hysteresis), `internal/alerts` (firing/acknowledged/resolved state machine, Postgres + `alerts.*` JetStream publish) — wired into `cmd/processor` as a second durable consumer of TELEMETRY (`windowed.go`) alongside the Phase 2 persistence consumer. `POST /v1/alerts/{id}/ack`/`/resolve` HTTP endpoints are deliberately deferred to Phase 4's `cmd/control` REST API. |
+| 3 — Stream processing & anomaly detection | `v0.4-phase3` | `internal/window` (Welford's incremental mean/variance + EWMA, count/age-bound sliding window per device/sensor), `internal/rules` (hot-reloadable YAML, `deploy/rules.yaml`), `internal/anomaly` (z-score/rate-of-change/silence detectors with M-consecutive hysteresis), `internal/alerts` (firing/acknowledged/resolved state machine, Postgres + `alerts.*` JetStream publish) — wired into `cmd/processor` as a second durable consumer of TELEMETRY (`windowed.go`) alongside the Phase 2 persistence consumer. `POST /v1/alerts/{id}/ack`/`/resolve` HTTP endpoints are deliberately deferred to Phase 4's `cmd/control` REST API. |
 | 4+ | *(not started)* | Control plane device shadow, staged rollouts, console, full observability, synthetic fleet + chaos testing, hardening, ESP32 firmware. |
 
 ## Where the full plan lives
