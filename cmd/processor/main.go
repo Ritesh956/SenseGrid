@@ -1,12 +1,12 @@
-// Command processor is the persistence consumer: it drains the TELEMETRY
-// JetStream stream and batch-writes readings into TimescaleDB (see
-// consumer.go). It also runs the schema migrations at startup — both
-// control and processor do this independently and idempotently rather
-// than one depending on the other's startup order; see
+// Command processor runs two independent durable JetStream consumers of
+// the TELEMETRY stream: the persistence consumer (consumer.go), batching
+// readings into TimescaleDB, and the Phase 3 windowed consumer
+// (windowed.go), maintaining sliding windows, publishing derived metrics,
+// and running anomaly detection. It also runs the schema migrations at
+// startup — both control and processor do this independently and
+// idempotently rather than one depending on the other's startup order; see
 // internal/migrations for how the (rare, cold-start-only) race between
-// them is made harmless. Windowed stream processing and anomaly detection
-// (Phase 3) will run in this same binary, on a second durable consumer of
-// the same stream.
+// them is made harmless.
 package main
 
 import (
@@ -21,11 +21,14 @@ import (
 	"github.com/nats-io/nats.go/jetstream"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 
+	"github.com/Ritesh956/SenseGrid/internal/alerts"
 	"github.com/Ritesh956/SenseGrid/internal/config"
 	"github.com/Ritesh956/SenseGrid/internal/httpserver"
 	"github.com/Ritesh956/SenseGrid/internal/logging"
 	"github.com/Ritesh956/SenseGrid/internal/migrations"
+	"github.com/Ritesh956/SenseGrid/internal/rules"
 	"github.com/Ritesh956/SenseGrid/internal/tracing"
+	"github.com/Ritesh956/SenseGrid/internal/window"
 )
 
 const defaultHTTPAddr = ":8082"
@@ -81,6 +84,31 @@ func main() {
 	go func() {
 		if err := c.run(ctx, js); err != nil {
 			logger.Error("processor: consumer exited with error", "err", err)
+			os.Exit(1)
+		}
+	}()
+
+	if err := ensureStreams(ctx, js); err != nil {
+		logger.Error("processor: ensuring METRICS/ALERTS streams", "err", err)
+		os.Exit(1)
+	}
+
+	rulesWatcher, err := rules.NewWatcher(cfg.RulesFile, logger)
+	if err != nil {
+		logger.Error("processor: loading rules file", "err", err, "path", cfg.RulesFile)
+		os.Exit(1)
+	}
+	go rulesWatcher.Run(ctx, cfg.RulesReloadInterval)
+
+	registry := window.NewRegistry(cfg.WindowMaxCount, cfg.WindowMaxAge, cfg.WindowEWMAAlpha)
+	alertsStore := alerts.NewStore(pool)
+	alertsPub := alerts.NewPublisher(js)
+
+	wc := newWindowedConsumer(js, registry, rulesWatcher, alertsStore, alertsPub, logger, newWindowedMetrics(),
+		cfg.RegistryTTL, cfg.RegistrySweep)
+	go func() {
+		if err := wc.run(ctx, js); err != nil {
+			logger.Error("processor: windowed consumer exited with error", "err", err)
 			os.Exit(1)
 		}
 	}()

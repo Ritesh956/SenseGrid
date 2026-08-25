@@ -32,6 +32,19 @@ type Config struct {
 	RedisAddr      string
 	TLSCAFile      string
 	OTLPEndpoint   string
+
+	RulesFile           string
+	RulesReloadInterval time.Duration
+
+	// WindowMaxCount/WindowMaxAge/WindowEWMAAlpha size the single shared
+	// sliding window kept per (device, sensor) — see internal/window and
+	// internal/rules' doc comment on why this is a process-wide setting
+	// rather than a per-rule one.
+	WindowMaxCount  int
+	WindowMaxAge    time.Duration
+	WindowEWMAAlpha float64
+	RegistryTTL     time.Duration
+	RegistrySweep   time.Duration
 }
 
 // Load builds a Config for serviceName, using defaultHTTPAddr when HTTP_ADDR
@@ -57,6 +70,15 @@ func Load(serviceName, defaultHTTPAddr string) Config {
 		RedisAddr:      getEnv("REDIS_ADDR", "localhost:6379"),
 		TLSCAFile:      getEnv("TLS_CA_FILE", ""),
 		OTLPEndpoint:   getEnv("OTEL_EXPORTER_OTLP_ENDPOINT", ""),
+
+		RulesFile:           getEnv("RULES_FILE", "deploy/rules.yaml"),
+		RulesReloadInterval: getDuration("RULES_RELOAD_INTERVAL", 5*time.Second),
+
+		WindowMaxCount:  getInt("WINDOW_MAX_COUNT", 100),
+		WindowMaxAge:    getDuration("WINDOW_MAX_AGE", 30*time.Second),
+		WindowEWMAAlpha: getFloat("WINDOW_EWMA_ALPHA", 0.3),
+		RegistryTTL:     getDuration("WINDOW_REGISTRY_TTL", 10*time.Minute),
+		RegistrySweep:   getDuration("WINDOW_REGISTRY_SWEEP_INTERVAL", 1*time.Minute),
 	}
 }
 
@@ -76,6 +98,7 @@ func (c Config) LogValue() slog.Value {
 		slog.Bool("postgres_dsn_set", c.PostgresDSN != ""),
 		slog.Bool("tls_ca_file_set", c.TLSCAFile != ""),
 		slog.Bool("otlp_endpoint_set", c.OTLPEndpoint != ""),
+		slog.String("rules_file", c.RulesFile),
 	)
 }
 
@@ -84,6 +107,30 @@ func getEnv(key, fallback string) string {
 		return v
 	}
 	return fallback
+}
+
+func getInt(key string, fallback int) int {
+	v, ok := os.LookupEnv(key)
+	if !ok || v == "" {
+		return fallback
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil {
+		return fallback
+	}
+	return n
+}
+
+func getFloat(key string, fallback float64) float64 {
+	v, ok := os.LookupEnv(key)
+	if !ok || v == "" {
+		return fallback
+	}
+	f, err := strconv.ParseFloat(v, 64)
+	if err != nil {
+		return fallback
+	}
+	return f
 }
 
 func getDuration(key string, fallback time.Duration) time.Duration {

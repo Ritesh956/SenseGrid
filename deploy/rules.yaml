@@ -1,0 +1,39 @@
+# Phase 3 detector rules — loaded and hot-reloaded by cmd/processor's
+# windowed consumer (internal/rules). Edit this file and the running
+# processor picks up the change within RULES_RELOAD_INTERVAL (default 5s),
+# no restart needed.
+#
+# sensor_type matches: "*" (any sensor), "prefix.*" (matches "prefix.x",
+# "prefix.y", ... — the flattened form of a vector reading like
+# accelerometer x/y/z), or an exact sensor_type.
+#
+# There is one shared sliding window per (device, sensor) — sized by the
+# WINDOW_MAX_COUNT / WINDOW_MAX_AGE / WINDOW_EWMA_ALPHA env vars, not by
+# individual rules below — that every zscore/rate_of_change rule for that
+# sensor evaluates against.
+#
+# consecutive is M: how many consecutive violations must occur before the
+# alert fires, and (symmetrically) how many consecutive clears before it
+# resolves — suppresses single-sample noise instead of firing on one blip.
+
+rules:
+  - name: accel-spike
+    sensor_type: "accel.*"
+    type: zscore
+    threshold: 3.5
+    consecutive: 3
+    severity: warning
+
+  - name: cpu-step-change
+    sensor_type: cpu
+    type: rate_of_change
+    threshold: 25.0
+    consecutive: 2
+    severity: warning
+
+  - name: device-silent
+    sensor_type: "*"
+    type: silence
+    silence_timeout: 60s
+    consecutive: 1
+    severity: critical

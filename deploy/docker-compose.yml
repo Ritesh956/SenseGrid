@@ -147,6 +147,13 @@ services:
     environment:
       <<: *go-env
       HTTP_ADDR: ":8082"
+      RULES_FILE: /rules/rules.yaml
+    volumes:
+      - ./certs:/certs:ro
+      # Bind-mounted (not baked in only) so editing the host file
+      # demonstrates Phase 3's rules hot-reload live, no rebuild/restart —
+      # see internal/rules.Watcher and deploy/docker/processor.Dockerfile.
+      - ./rules.yaml:/rules/rules.yaml:ro
     ports:
       - "8082:8082"
     depends_on:

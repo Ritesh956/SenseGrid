@@ -1,0 +1,138 @@
+package alerts
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"time"
+
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgxpool"
+)
+
+// Alert is one row of the alerts table.
+type Alert struct {
+	ID             string
+	DeviceID       string
+	SensorType     string
+	RuleName       string
+	Severity       string
+	State          State
+	Detail         map[string]any
+	FiredAt        time.Time
+	AcknowledgedAt *time.Time
+	ResolvedAt     *time.Time
+	UpdatedAt      time.Time
+}
+
+// Store is the Postgres-backed alert repository. Like internal/devices.Store,
+// it's a thin I/O wrapper with no unit tests of its own (no test-DB harness
+// exists in this repo yet) — the state-machine logic it enforces is tested
+// separately, in Machine (machine_test.go).
+type Store struct {
+	pool *pgxpool.Pool
+}
+
+func NewStore(pool *pgxpool.Pool) *Store {
+	return &Store{pool: pool}
+}
+
+const alertColumns = "id, device_id, sensor_type, rule_name, severity, state, detail, fired_at, acknowledged_at, resolved_at, updated_at"
+
+// Open records a new firing alert for (deviceID, sensorType, ruleName),
+// generating id itself (matching internal/devices' convention of
+// Go-generated UUIDs rather than a Postgres default). If an alert for the
+// same key is already open (not resolved), the partial unique index
+// alerts_open_idx rejects the insert with a unique_violation and Open
+// instead returns that existing row with opened=false — this is what
+// makes "never re-fire an already-firing alert" true even under a
+// defensive double-call, on top of anomaly.Evaluator already being
+// edge-triggered.
+func (s *Store) Open(ctx context.Context, id, deviceID, sensorType, ruleName, severity string, detail map[string]any, firedAt time.Time) (alert *Alert, opened bool, err error) {
+	detailJSON, err := json.Marshal(detail)
+	if err != nil {
+		return nil, false, fmt.Errorf("alerts: marshaling detail: %w", err)
+	}
+
+	row := s.pool.QueryRow(ctx, `
+		INSERT INTO alerts (id, device_id, sensor_type, rule_name, severity, state, detail, fired_at)
+		VALUES ($1, $2, $3, $4, $5, 'firing', $6, $7)
+		RETURNING `+alertColumns,
+		id, deviceID, sensorType, ruleName, severity, detailJSON, firedAt)
+	a, err := scanAlert(row)
+	if err == nil {
+		return a, true, nil
+	}
+
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) && pgErr.Code == "23505" {
+		existing, ferr := s.getOpen(ctx, deviceID, sensorType, ruleName)
+		return existing, false, ferr
+	}
+	return nil, false, fmt.Errorf("alerts: opening %s/%s/%s: %w", deviceID, sensorType, ruleName, err)
+}
+
+// Resolve transitions the currently-open alert for (deviceID, sensorType,
+// ruleName) to Resolved. Returns (nil, nil) if there is no open alert for
+// that key — anomaly.Evaluator only calls this on an edge-triggered
+// Cleared transition, so that should be rare, not an error condition.
+func (s *Store) Resolve(ctx context.Context, deviceID, sensorType, ruleName string, resolvedAt time.Time) (*Alert, error) {
+	row := s.pool.QueryRow(ctx, `
+		UPDATE alerts SET state = 'resolved', resolved_at = $4, updated_at = now()
+		WHERE device_id = $1 AND sensor_type = $2 AND rule_name = $3 AND state <> 'resolved'
+		RETURNING `+alertColumns,
+		deviceID, sensorType, ruleName, resolvedAt)
+	a, err := scanAlert(row)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("alerts: resolving %s/%s/%s: %w", deviceID, sensorType, ruleName, err)
+	}
+	return a, nil
+}
+
+// Acknowledge transitions a firing alert (by id) to Acknowledged. Not
+// called anywhere in Phase 3 — it exists for Phase 4's
+// POST /v1/alerts/{id}/ack handler to call without needing to touch this
+// package.
+func (s *Store) Acknowledge(ctx context.Context, id string) (*Alert, error) {
+	row := s.pool.QueryRow(ctx, `
+		UPDATE alerts SET state = 'acknowledged', acknowledged_at = now(), updated_at = now()
+		WHERE id = $1 AND state = 'firing'
+		RETURNING `+alertColumns, id)
+	a, err := scanAlert(row)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, fmt.Errorf("alerts: %s is not a firing alert", id)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("alerts: acknowledging %s: %w", id, err)
+	}
+	return a, nil
+}
+
+func (s *Store) getOpen(ctx context.Context, deviceID, sensorType, ruleName string) (*Alert, error) {
+	row := s.pool.QueryRow(ctx, `
+		SELECT `+alertColumns+`
+		FROM alerts
+		WHERE device_id = $1 AND sensor_type = $2 AND rule_name = $3 AND state <> 'resolved'`,
+		deviceID, sensorType, ruleName)
+	return scanAlert(row)
+}
+
+func scanAlert(row pgx.Row) (*Alert, error) {
+	var a Alert
+	var detailJSON []byte
+	if err := row.Scan(&a.ID, &a.DeviceID, &a.SensorType, &a.RuleName, &a.Severity, &a.State,
+		&detailJSON, &a.FiredAt, &a.AcknowledgedAt, &a.ResolvedAt, &a.UpdatedAt); err != nil {
+		return nil, err
+	}
+	if len(detailJSON) > 0 {
+		if err := json.Unmarshal(detailJSON, &a.Detail); err != nil {
+			return nil, fmt.Errorf("alerts: unmarshaling detail: %w", err)
+		}
+	}
+	return &a, nil
+}

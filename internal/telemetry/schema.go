@@ -23,6 +23,12 @@ const (
 	TelemetryStreamName = "TELEMETRY"
 	DLQStreamName       = "DLQ"
 	DLQSubject          = "dlq.telemetry"
+
+	// MetricsStreamName and AlertsStreamName are created by cmd/processor
+	// (Phase 3), which is both their producer and — for alerts — also a
+	// consumer of its own alert-clearing logic. See cmd/processor/jetstream.go.
+	MetricsStreamName = "METRICS"
+	AlertsStreamName  = "ALERTS"
 )
 
 // Reading is one sensor sample. Use Value for a scalar reading (e.g. CPU
@@ -86,6 +92,18 @@ func TelemetryTopic(deviceID string) string {
 // filter subject reads from.
 func JetStreamSubject(deviceID string) string {
 	return "telemetry." + deviceID
+}
+
+// MetricsSubject returns the JetStream subject the Phase 3 windowed
+// consumer publishes derived per-window metrics to.
+func MetricsSubject(deviceID string) string {
+	return "metrics." + deviceID
+}
+
+// AlertsSubject returns the JetStream subject alert fire/acknowledge/
+// resolve events are published to for a device.
+func AlertsSubject(deviceID string) string {
+	return "alerts." + deviceID
 }
 
 // NewTraceID returns a W3C trace-id shaped correlation id: 32 lowercase
