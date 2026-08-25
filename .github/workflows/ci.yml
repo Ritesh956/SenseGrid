@@ -23,6 +23,13 @@ jobs:
         uses: golangci/golangci-lint-action@v6
         with:
           version: latest
+          # golangci-lint's prebuilt binary release can lag behind the
+          # newest Go toolchain (it refuses to analyze a module whose go.mod
+          # targets a newer Go version than it was itself built with) —
+          # goinstall builds it from source with the runner's own Go
+          # toolchain (matched to go.mod via go-version-file above) instead
+          # of downloading a binary, sidestepping that version race.
+          install-mode: goinstall
 
       - name: Test
         run: go test ./... -race
