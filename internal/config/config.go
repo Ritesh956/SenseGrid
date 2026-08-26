@@ -44,6 +44,14 @@ type Config struct {
 	JWTIssuer     string
 	JWTAccessTTL  time.Duration
 
+	// JWTConsoleTTL is the session length for POST /v1/auth/login-minted
+	// tokens (Phase 5) — deliberately its own setting rather than reusing
+	// JWTAccessTTL: CLI-minted automation tokens should stay short-lived
+	// (15m default), but forcing an interactive console user to re-login
+	// every 15 minutes would just be bad UX for no security benefit, so
+	// this defaults much longer.
+	JWTConsoleTTL time.Duration
+
 	// DriftStaleAfter is how long a device can go without a state report
 	// before GET /v1/devices/drift considers it drifted even if its last
 	// applied_revision matched — see internal/shadow.Drift.
@@ -100,6 +108,7 @@ func Load(serviceName, defaultHTTPAddr string) Config {
 		JWTSigningKey: getEnv("JWT_SIGNING_KEY", ""),
 		JWTIssuer:     getEnv("JWT_ISSUER", "sensegrid-control"),
 		JWTAccessTTL:  getDuration("JWT_ACCESS_TTL", 15*time.Minute),
+		JWTConsoleTTL: getDuration("JWT_CONSOLE_TTL", 12*time.Hour),
 
 		DriftStaleAfter: getDuration("SHADOW_DRIFT_STALE_AFTER", 2*time.Minute),
 

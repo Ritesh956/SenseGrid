@@ -33,7 +33,7 @@ func runJWTCLI(args []string) error {
 		return fmt.Errorf("JWT_SIGNING_KEY is not set")
 	}
 
-	token, err := signToken(*role, cfg.JWTIssuer, *ttl, []byte(cfg.JWTSigningKey))
+	token, err := signToken(*role, cfg.JWTIssuer, *ttl, []byte(cfg.JWTSigningKey), "")
 	if err != nil {
 		return err
 	}

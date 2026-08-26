@@ -31,7 +31,7 @@ func TestRoleAllows(t *testing.T) {
 
 func TestSignAndVerifyRoundTrip(t *testing.T) {
 	key := []byte("test-signing-key")
-	token, err := signToken(roleAdmin, "sensegrid-control", time.Hour, key)
+	token, err := signToken(roleAdmin, "sensegrid-control", time.Hour, key, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -47,19 +47,53 @@ func TestSignAndVerifyRoundTrip(t *testing.T) {
 	}
 }
 
+func TestVerifyToken_Subject(t *testing.T) {
+	key := []byte("test-signing-key")
+
+	token, err := signToken(roleOperator, "sensegrid-control", time.Hour, key, "alice")
+	if err != nil {
+		t.Fatal(err)
+	}
+	role, subject, err := verifyToken(token, "sensegrid-control", key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if role != roleOperator {
+		t.Errorf("role = %q, want %q", role, roleOperator)
+	}
+	if subject != "alice" {
+		t.Errorf("subject = %q, want %q", subject, "alice")
+	}
+
+	// CLI-minted tokens (jwt_cli.go) pass "" — verifyToken must round-trip
+	// that as cleanly as a real username, since requireRole never looks at
+	// subject at all.
+	cliToken, err := signToken(roleAdmin, "sensegrid-control", time.Hour, key, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, subject, err := verifyToken(cliToken, "sensegrid-control", key); err != nil || subject != "" {
+		t.Errorf("subject = %q, err = %v, want \"\", nil", subject, err)
+	}
+
+	if _, _, err := verifyToken("", "sensegrid-control", key); err == nil {
+		t.Error("empty token: expected an error, got nil")
+	}
+}
+
 func TestVerifyBearer_Rejections(t *testing.T) {
 	key := []byte("test-signing-key")
 	wrongKey := []byte("wrong-signing-key")
 
-	expired, err := signToken(roleViewer, "sensegrid-control", -time.Minute, key)
+	expired, err := signToken(roleViewer, "sensegrid-control", -time.Minute, key, "")
 	if err != nil {
 		t.Fatal(err)
 	}
-	wrongSig, err := signToken(roleViewer, "sensegrid-control", time.Hour, wrongKey)
+	wrongSig, err := signToken(roleViewer, "sensegrid-control", time.Hour, wrongKey, "")
 	if err != nil {
 		t.Fatal(err)
 	}
-	wrongIssuer, err := signToken(roleViewer, "someone-else", time.Hour, key)
+	wrongIssuer, err := signToken(roleViewer, "someone-else", time.Hour, key, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -90,8 +124,8 @@ func TestVerifyBearer_Rejections(t *testing.T) {
 
 func TestRequireRole(t *testing.T) {
 	key := []byte("test-signing-key")
-	viewerToken, _ := signToken(roleViewer, "sensegrid-control", time.Hour, key)
-	adminToken, _ := signToken(roleAdmin, "sensegrid-control", time.Hour, key)
+	viewerToken, _ := signToken(roleViewer, "sensegrid-control", time.Hour, key, "")
+	adminToken, _ := signToken(roleAdmin, "sensegrid-control", time.Hour, key, "")
 
 	handler := requireRole(roleAdmin, "sensegrid-control", key, func(w http.ResponseWriter, r *http.Request, role string) {
 		w.WriteHeader(http.StatusOK)

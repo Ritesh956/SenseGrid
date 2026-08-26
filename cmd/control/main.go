@@ -37,6 +37,7 @@ import (
 	"github.com/Ritesh956/SenseGrid/internal/rollout"
 	"github.com/Ritesh956/SenseGrid/internal/shadow"
 	"github.com/Ritesh956/SenseGrid/internal/tlsutil"
+	"github.com/Ritesh956/SenseGrid/internal/users"
 )
 
 const (
@@ -56,6 +57,13 @@ func main() {
 	}
 	if len(os.Args) > 1 && os.Args[1] == "jwt" {
 		if err := runJWTCLI(os.Args[2:]); err != nil {
+			fmt.Fprintln(os.Stderr, "error:", err)
+			os.Exit(1)
+		}
+		return
+	}
+	if len(os.Args) > 1 && os.Args[1] == "user" {
+		if err := runUserCLI(os.Args[2:]); err != nil {
 			fmt.Fprintln(os.Stderr, "error:", err)
 			os.Exit(1)
 		}
@@ -95,6 +103,7 @@ func runServer() {
 	}
 	logger.Info("postgres: migrations up to date")
 	deviceStore := devices.New(pool)
+	userStore := users.New(pool)
 
 	if cfg.JWTSigningKey == "" {
 		logger.Error("JWT_SIGNING_KEY is not set — required for Phase 4's auth-gated endpoints")
@@ -169,6 +178,8 @@ func runServer() {
 	registerDeviceHandlers(mux, logger, deviceStore, shadowStore, shadowPub, cfg.DriftStaleAfter, cfg.JWTIssuer, signingKey)
 	registerAlertHandlers(mux, logger, alertsStore, alertsPub, cfg.JWTIssuer, signingKey)
 	registerRolloutHandlers(mux, logger, rolloutEngine, cfg.JWTIssuer, signingKey)
+	registerAuthHandlers(mux, logger, userStore, cfg.JWTIssuer, signingKey, cfg.JWTConsoleTTL)
+	registerWSHandler(mux, logger, nc, cfg.JWTIssuer, signingKey)
 	registerStaticFiles(mux)
 
 	if err := httpserver.Run(ctx, srv, cfg.ShutdownTimeout, cfg.HTTPTLSCertFile, cfg.HTTPTLSKeyFile, logger); err != nil {

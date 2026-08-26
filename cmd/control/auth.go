@@ -1,9 +1,11 @@
 // Phase 4 JWT auth: three roles (admin/operator/viewer), HMAC-signed
-// (HS256) with one shared signing key from JWT_SIGNING_KEY. No login
-// endpoint exists yet — tokens are minted by `control jwt create` (see
-// jwt_cli.go), which reads the same signing key via the same
-// config.Load(), so the CLI and the running server are always in sync.
-// A real login endpoint is Phase 5's job, once the console needs one.
+// (HS256) with one shared signing key from JWT_SIGNING_KEY. Tokens are
+// minted two ways: `control jwt create` (jwt_cli.go, no subject — shell
+// access to the binary is the auth boundary) and, since Phase 5,
+// POST /v1/auth/login (auth_login.go, subject = username, backed by
+// internal/users). Both call signToken and produce tokens requireRole
+// verifies identically — a login-minted token is not a different kind of
+// token, just one with a subject and a different TTL.
 package main
 
 import (
@@ -48,8 +50,12 @@ type claims struct {
 	jwt.RegisteredClaims
 }
 
-// signToken mints a signed JWT for role, valid for ttl.
-func signToken(role, issuer string, ttl time.Duration, signingKey []byte) (string, error) {
+// signToken mints a signed JWT for role, valid for ttl. subject is the
+// username for a login-minted token (auth_login.go), or "" for a
+// CLI-minted one (jwt_cli.go) — requireRole never looks at it; it exists
+// purely so a login session's token can be traced back to who it belongs
+// to (logs, future auditing), not as part of the auth decision itself.
+func signToken(role, issuer string, ttl time.Duration, signingKey []byte, subject string) (string, error) {
 	if _, ok := roleRank[role]; !ok {
 		return "", fmt.Errorf("auth: unknown role %q", role)
 	}
@@ -57,6 +63,7 @@ func signToken(role, issuer string, ttl time.Duration, signingKey []byte) (strin
 	c := claims{
 		Role: role,
 		RegisteredClaims: jwt.RegisteredClaims{
+			Subject:   subject,
 			Issuer:    issuer,
 			IssuedAt:  jwt.NewNumericDate(now),
 			ExpiresAt: jwt.NewNumericDate(now.Add(ttl)),
@@ -70,6 +77,28 @@ func signToken(role, issuer string, ttl time.Duration, signingKey []byte) (strin
 	return signed, nil
 }
 
+// verifyToken parses and validates a raw JWT string, returning its role
+// and subject (subject is "" for a CLI-minted token — see signToken).
+// Shared by verifyBearer (Authorization header, every REST endpoint) and
+// the WS handshake (?token= query param, ws_handler.go — a browser
+// WebSocket client can't set a custom Authorization header).
+func verifyToken(tokenStr, issuer string, signingKey []byte) (role, subject string, err error) {
+	if tokenStr == "" {
+		return "", "", fmt.Errorf("auth: empty token")
+	}
+	var c claims
+	_, err = jwt.ParseWithClaims(tokenStr, &c, func(*jwt.Token) (any, error) {
+		return signingKey, nil
+	}, jwt.WithValidMethods([]string{"HS256"}), jwt.WithIssuer(issuer))
+	if err != nil {
+		return "", "", fmt.Errorf("auth: invalid token: %w", err)
+	}
+	if _, ok := roleRank[c.Role]; !ok {
+		return "", "", fmt.Errorf("auth: unknown role %q", c.Role)
+	}
+	return c.Role, c.Subject, nil
+}
+
 // verifyBearer parses and validates the Authorization: Bearer <token>
 // header on r, returning the token's role.
 func verifyBearer(r *http.Request, issuer string, signingKey []byte) (string, error) {
@@ -78,18 +107,8 @@ func verifyBearer(r *http.Request, issuer string, signingKey []byte) (string, er
 	if !ok || tokenStr == "" {
 		return "", fmt.Errorf("auth: missing or malformed Authorization header")
 	}
-
-	var c claims
-	_, err := jwt.ParseWithClaims(tokenStr, &c, func(*jwt.Token) (any, error) {
-		return signingKey, nil
-	}, jwt.WithValidMethods([]string{"HS256"}), jwt.WithIssuer(issuer))
-	if err != nil {
-		return "", fmt.Errorf("auth: invalid token: %w", err)
-	}
-	if _, ok := roleRank[c.Role]; !ok {
-		return "", fmt.Errorf("auth: unknown role %q", c.Role)
-	}
-	return c.Role, nil
+	role, _, err := verifyToken(tokenStr, issuer, signingKey)
+	return role, err
 }
 
 // requireRole wraps handler so it only runs for a request bearing a valid

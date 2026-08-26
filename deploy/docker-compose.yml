@@ -204,3 +204,34 @@ services:
     depends_on:
       mosquitto:
         condition: service_healthy
+
+  # --- Console (Phase 5) -------------------------------------------------
+  console:
+    build:
+      context: ..
+      dockerfile: deploy/docker/console.Dockerfile
+      args:
+        # NEXT_PUBLIC_* vars are inlined into the client bundle at `next
+        # build` time, not read at container start — this has to be a
+        # build arg, not a runtime environment: entry below (see
+        # console.Dockerfile's doc comment). Host-exposed port, not the
+        # Docker-internal one: the browser can't resolve "control".
+        NEXT_PUBLIC_CONTROL_WS_URL: ${NEXT_PUBLIC_CONTROL_WS_URL:-wss://localhost:8090/v1/ws}
+    networks: [sensegrid]
+    volumes:
+      - ./certs:/certs:ro
+    environment:
+      # Docker-internal hostname — the console's Next.js BFF route
+      # handlers call cmd/control server-side (see web/console/src/lib/
+      # control-api.ts).
+      CONTROL_API_URL: https://control:8080
+      NODE_EXTRA_CA_CERTS: /certs/ca.pem
+      NEXTAUTH_SECRET: ${NEXTAUTH_SECRET:?set NEXTAUTH_SECRET in .env}
+      NEXTAUTH_URL: ${NEXTAUTH_URL:-http://localhost:3100}
+    ports:
+      # Host 3000 is commonly already taken by another project's dev
+      # server — 3100 avoids that collision without changing anything
+      # inside the container (still listens on 3000 there).
+      - "3100:3000"
+    depends_on:
+      - control

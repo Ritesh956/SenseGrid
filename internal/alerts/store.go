@@ -150,6 +150,57 @@ func (s *Store) FiringCountForDevices(ctx context.Context, deviceIDs []string, s
 	return count, nil
 }
 
+// Filter narrows List: a zero State matches every state, an empty
+// DeviceID matches every device, and Limit <= 0 falls back to
+// defaultListLimit.
+type Filter struct {
+	State    State
+	DeviceID string
+	Limit    int
+}
+
+const defaultListLimit = 200
+
+// List returns alerts newest-first, optionally narrowed by Filter — the
+// backing query for Phase 5's GET /v1/alerts (fleet alert badges and the
+// console's Alerts view), the first read path this store has needed beyond
+// the single-alert lookups above.
+func (s *Store) List(ctx context.Context, filter Filter) ([]*Alert, error) {
+	limit := filter.Limit
+	if limit <= 0 {
+		limit = defaultListLimit
+	}
+
+	query := `SELECT ` + alertColumns + ` FROM alerts WHERE 1 = 1`
+	args := []any{}
+	if filter.State != "" {
+		args = append(args, filter.State)
+		query += fmt.Sprintf(" AND state = $%d", len(args))
+	}
+	if filter.DeviceID != "" {
+		args = append(args, filter.DeviceID)
+		query += fmt.Sprintf(" AND device_id = $%d", len(args))
+	}
+	args = append(args, limit)
+	query += fmt.Sprintf(" ORDER BY fired_at DESC LIMIT $%d", len(args))
+
+	rows, err := s.pool.Query(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("alerts: listing: %w", err)
+	}
+	defer rows.Close()
+
+	var out []*Alert
+	for rows.Next() {
+		a, err := scanAlert(rows)
+		if err != nil {
+			return nil, fmt.Errorf("alerts: scanning list row: %w", err)
+		}
+		out = append(out, a)
+	}
+	return out, rows.Err()
+}
+
 func (s *Store) getOpen(ctx context.Context, deviceID, sensorType, ruleName string) (*Alert, error) {
 	row := s.pool.QueryRow(ctx, `
 		SELECT `+alertColumns+`

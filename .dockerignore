@@ -1,0 +1,7 @@
+# Keeps the console's local node_modules/.next out of every service's
+# Docker build context (build context is the repo root for all of them) —
+# without this, running `npm install` locally in web/console before
+# `docker compose build` would balloon every image build, not just
+# console's.
+**/node_modules/
+**/.next/
