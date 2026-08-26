@@ -1,4 +1,4 @@
-# Phase 6 scrape config. Every target is a Docker-network hostname:port —
+# Phase 6 scrape config, extended in Phase 7 for cmd/fleet. Every target is a Docker-network hostname:port —
 # Prometheus lives on the same `sensegrid` network as everything else (see
 # deploy/docker-compose.yml), so none of this depends on host port mappings.
 # cmd/control's target is its separate plain-HTTP metrics port
@@ -20,3 +20,14 @@ scrape_configs:
   - job_name: control
     static_configs:
       - targets: ["control:9091"]
+
+  # cmd/fleet's /metrics shares its main HTTP_ADDR (:8083), matching
+  # ingest/processor's convention rather than control's separate port —
+  # fleet has no HTTPS listener to keep it off of. See
+  # test/chaos/ramp.sh, which reads sensegrid_processor_end_to_end_latency_seconds
+  # and sensegrid_ingest_lag_seconds (not fleet's own metrics) for the
+  # latency-vs-fleet-size curve; fleet's counters are for its own health
+  # during a chaos run.
+  - job_name: fleet
+    static_configs:
+      - targets: ["fleet:8083"]

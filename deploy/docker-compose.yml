@@ -8,6 +8,12 @@ volumes:
   redis_data:
   prometheus_data:
   grafana_data:
+  # chaos_data/fleet_data are deliberately host bind mounts (below), not
+  # named volumes: control and fleet both run as distroless nonroot
+  # (uid 65532), and a fresh named volume is created root-owned with no
+  # chown mechanism available (no shell in the image) — the same reason
+  # ./certs is already a bind mount rather than a volume. See
+  # test/chaos/README.md.
 
 x-go-service: &go-service
   build:
@@ -214,6 +220,9 @@ services:
       MQTT_CONTROL_PASSWORD: ${MQTT_CONTROL_PASSWORD:?set MQTT_CONTROL_PASSWORD in .env}
       JWT_SIGNING_KEY: ${JWT_SIGNING_KEY:?set JWT_SIGNING_KEY in .env}
       METRICS_ADDR: ":9091"
+    volumes:
+      - ./certs:/certs:ro
+      - ../test/chaos/data:/chaos-data # `token create -count N -out /chaos-data/...` for cmd/fleet — see test/chaos/README.md
     ports:
       - "8090:8080" # host 8080 was already in use on the dev machine; HTTPS
       - "9091:9091" # Phase 6 /metrics — plain HTTP, matching ingest/processor's existing host-exposed convention
@@ -237,11 +246,25 @@ services:
     environment:
       <<: *go-env
       HTTP_ADDR: ":8083"
+      # Inert by default (FLEET_TARGET_DEVICES unset -> 0, see cmd/fleet's
+      # main.go doc comment) — test/chaos's scripts scale it up over
+      # POST /fleet/scale. CONTROL_URL is the in-network hostname, same
+      # pattern as the console BFF's CONTROL_API_URL above.
+      CONTROL_URL: https://control:8080
+      FLEET_TARGET_DEVICES: ${FLEET_TARGET_DEVICES:-0}
+      FLEET_TOKENS_FILE: ${FLEET_TOKENS_FILE:-/chaos-data/fleet-tokens.txt}
+      FLEET_STATE_DIR: /data/fleet-devices
+    volumes:
+      - ./certs:/certs:ro
+      - ../test/chaos/data:/chaos-data:ro
+      - ../test/chaos/fleet-data:/data
     ports:
       - "8083:8083"
     depends_on:
       mosquitto:
         condition: service_healthy
+      control:
+        condition: service_started
 
   # --- Console (Phase 5) -------------------------------------------------
   console:

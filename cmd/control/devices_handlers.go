@@ -109,7 +109,13 @@ func registerDeviceHandlers(mux *http.ServeMux, logger *slog.Logger, deviceStore
 			return
 		}
 
-		var drifted []deviceView
+		// []deviceView{}, not var drifted []deviceView: a nil slice
+		// marshals to JSON `null` rather than `[]` when nothing has
+		// drifted, which breaks naive consumers doing `.devices[]`
+		// (test/chaos/partition.sh's drift poll hit exactly this — found
+		// live, not theoretical). GET /v1/devices's toDeviceViews already
+		// avoids this the same way.
+		drifted := []deviceView{}
 		for _, d := range list {
 			_, rev, err := shadowStore.GetDesired(ctx, d.ID)
 			if err != nil {
