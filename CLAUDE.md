@@ -10,13 +10,13 @@ and a laptop host agent flows through MQTT → NATS JetStream → TimescaleDB, w
 provisions devices and (from Phase 4 on) pushes config back down to them. Synthetic load only enters
 via `cmd/fleet` (Phase 7), not the primary data path — the phone and laptop are real hardware.
 
-**Current status: Phases 0–5 tagged** (`v0.1-phase0`, `v0.2-phase1`, `v0.3-phase2`, `v0.4-phase3`,
-`v0.5-phase4`, `v0.6-phase5`). Phase 5 (console) added `web/console` (Next.js + TypeScript + Tailwind,
-NextAuth login), a real `POST /v1/auth/login` backed by `internal/users` (`control user create` CLI,
-mirroring the existing CLI-only provisioning pattern), a `GET /v1/ws` live feed off NATS, and
-`GET /v1/alerts` — the first alert-listing endpoint, alongside the existing ack/resolve — see "Console
-(Phase 5)" below. Phase 6 (full observability) is next. See "Phase status" below before assuming
-something isn't built yet — check git tags and `internal/` first.
+**Current status: Phases 0–6 tagged** (`v0.1-phase0`, `v0.2-phase1`, `v0.3-phase2`, `v0.4-phase3`,
+`v0.5-phase4`, `v0.6-phase5`, `v0.7-phase6`). Phase 6 (full observability) scraped the Prometheus metrics
+Phase 2 already exposed but never scraped, extended tracing and added a `/metrics` port to `cmd/control`
+(the one service that had neither), and provisioned Grafana entirely as code (`deploy/grafana`) —
+3 dashboards and 3 SLO alert rules — see "Observability (Phase 6)" below. Phase 7 (synthetic fleet &
+chaos testing) is next. See "Phase status" below before assuming something isn't built yet — check git
+tags and `internal/` first.
 
 ## Commands
 
@@ -48,6 +48,10 @@ docker compose -f deploy/docker-compose.yml --env-file .env exec control /app jw
 
 # Provision the first console login (admin CLI, not an HTTP endpoint — see "REST API auth")
 docker compose -f deploy/docker-compose.yml --env-file .env exec control /app user create -username admin -role admin -password <password>
+
+# Prometheus scrape health: http://localhost:9190/targets
+# Grafana (admin/admin), dashboards + alerting provisioned as code: http://localhost:3300
+# — see "Observability (Phase 6)"
 
 # Run hostagent natively against the compose stack (it is NOT a compose service — see below)
 HOSTAGENT_CLAIM_TOKEN=<token from above> \
@@ -86,8 +90,11 @@ hostagent (Go) ─┴─► Mosquitto (dynamic-security auth) ┘         │   
 - **`cmd/control`** is the provisioning/admin plane: issues one-time registration tokens (CLI only, see
   below), serves `POST /v1/devices/claim`, and serves the PWA's static files at the same origin (no
   separate web server, no CORS to configure).
-- Every hop that touches a `Reading` emits an OTel span sharing the payload's `trace_id`, exported to
-  Jaeger — pull a reading's whole journey by that ID at `http://localhost:16686`.
+- Every hop that touches a `Reading` (or the `MetricEvent` derived from it) emits an OTel span sharing
+  the payload's `trace_id`, exported to Jaeger — pull a reading's whole journey by that ID at
+  `http://localhost:16686`. As of Phase 6 that's `ingest.publish` → `processor.persist`/
+  `processor.window` → `control.ws_relay` (see "Observability" below) — device to the edge of the
+  console, not just to the database.
 
 ### Auth model (dynamic-security plugin — read this before touching anything MQTT-related)
 
@@ -168,7 +175,7 @@ know before touching it:
 
 | Binary | Port | Dockerfile | Notes |
 |---|---|---|---|
-| `cmd/control` | 8090→8080 (HTTPS) | `deploy/docker/control.Dockerfile` | Own Dockerfile: also serves `web/sensor-client` and needs `deploy/migrations`. Since Phase 4 also connects to NATS/JetStream (shadow KV, rollout state/events) and dials the broker itself as the `control` MQTT identity, in addition to the dynsec admin channel. |
+| `cmd/control` | 8090→8080 (HTTPS), 9091 (metrics) | `deploy/docker/control.Dockerfile` | Own Dockerfile: also serves `web/sensor-client` and needs `deploy/migrations`. Since Phase 4 also connects to NATS/JetStream (shadow KV, rollout state/events) and dials the broker itself as the `control` MQTT identity, in addition to the dynsec admin channel. Since Phase 6, `/metrics` is a second, plain-HTTP server on its own port (`METRICS_ADDR`) rather than sharing the HTTPS one — see "Observability" below. |
 | `cmd/ingest` | 8081 | `deploy/docker/go.Dockerfile` (generic) | |
 | `cmd/processor` | 8082 | `deploy/docker/processor.Dockerfile` | Own Dockerfile: needs `deploy/migrations`. |
 | `cmd/fleet` | 8083 | `deploy/docker/go.Dockerfile` (generic) | Stub until Phase 7. |
@@ -179,6 +186,8 @@ know before touching it:
 | Redis | 6379 | image | Tokens only (see auth model). |
 | Jaeger | 16686 (UI), 4317 (OTLP) | image | Accepts OTLP directly — no separate OTel Collector. |
 | `web/console` | 3100→3000 | `deploy/docker/console.Dockerfile` | Next.js, not a Go binary — see "Console (Phase 5)" above for why it's structured differently from everything else in this table. |
+| Prometheus | 9190→9090 | image | Scrapes `ingest:8081`, `processor:8082`, `control:9091` — see `deploy/prometheus/prometheus.yml` and "Observability" below. |
+| Grafana | 3300→3000 | image | Dashboards + alert rules provisioned as code from `deploy/grafana/`, admin/admin. |
 
 Shared `internal/` packages, briefly: `config` (env-driven `Config` struct, one `Load()` per service),
 `logging` (slog JSON), `httpserver` (health server + graceful shutdown, optional TLS), `tlsutil` (dev
@@ -242,6 +251,47 @@ root module's `go build ./...`/`go test ./...` would otherwise walk into and pic
 (nothing ever imports it) marks the whole subtree as a separate module, which the root module's `...`
 pattern skips automatically. Found live after `npm install` in this directory, not theoretical.
 
+### Observability (Phase 6)
+
+Almost entirely a matter of *exposing and provisioning* what Phases 2–5 had already built, not
+introducing metrics/tracing for the first time — `cmd/ingest` and `cmd/processor` have had `/metrics`
+since Phase 2, just never scraped, and `internal/tracing` has been wired into `cmd/ingest`/`cmd/processor`
+since Phase 2 too.
+
+- **`cmd/control` got its first Prometheus/tracing wiring this phase** (`cmd/control/metrics.go`):
+  `sensegrid_control_ws_clients_connected` (inc/dec around each `GET /v1/ws` connection —
+  `ws_handler.go`) and `sensegrid_control_active_devices` (a periodic gauge reusing
+  `cfg.DriftStaleAfter`, the same "still meaningfully connected" threshold `internal/shadow.Drift`
+  already uses, rather than inventing a second one). Exposed on a **separate plain-HTTP port**
+  (`METRICS_ADDR`, `:9091` default) instead of sharing `cmd/control`'s HTTPS API port — Prometheus
+  scrapes it over the internal Docker network, so there's no reason to make it trust the dev CA cert
+  too.
+- **The WS relay (`ws_handler.go`) extends a reading's trace one hop further**: `MetricEvent` carries
+  the `trace_id` of the reading it was computed from (`AlertEvent`/`RolloutEvent` don't — no bridging
+  attempted for those two frame kinds), so relaying a `metrics.>` message to a console viewer opens a
+  short `control.ws_relay` span joined to that same trace via `tracing.ContextWithReadingTrace` — the
+  same bridge `cmd/processor` already uses. This is what makes a trace "browsable end-to-end, device →
+  console" (the DoD's wording) — the actual browser hop isn't instrumented (no OTel SDK in
+  `web/console`; that would be scope creep for this phase), but the last server-side hop before it is.
+- **`cmd/processor`'s two durable consumers (persistence, windowing) each gained a `consumer_lag` gauge**
+  (`sensegrid_processor_consumer_lag` / `_windowed_consumer_lag`), polled every 5s via the JetStream
+  `Consumer.Info` call each `run()` loop already has the `jetstream.Consumer` handle for — the one
+  genuinely new signal this phase adds; everything else is exposure of what already existed.
+- **`cmd/fleet` got nothing this phase** — still a placeholder stub (Phase 7's job), so instrumenting it
+  would just be measuring code that doesn't do anything yet.
+- **Grafana is entirely file-provisioned** (`deploy/grafana/provisioning/**`, `deploy/grafana/dashboards/*.json`)
+  — one Prometheus datasource with a **fixed `uid: prometheus`** (not Grafana's auto-generated default,
+  since `provisioning/alerting/slo-rules.yml` references it explicitly by that UID and a random one would
+  break on every fresh provision), 3 dashboards (fleet-health, pipeline-latency, alerts), and 3
+  Grafana-managed SLO alert rules — no separate Alertmanager container, this project has no
+  on-call/paging need to justify one. No metric anywhere in this codebase carries labels (every
+  `prometheus.Counter`/`Histogram`/`Gauge` is label-less) — Phase 6 kept that convention for its new
+  metrics too rather than introducing the first `*Vec`.
+- Host ports **9090** (Prometheus' own default) and **3000–3002** were already taken by other local
+  projects when this was built — Prometheus → **9190**, Grafana → **3300**, same reasoning as the
+  console's 3100 mapping (Phase 5). If you hit a port conflict on a different machine, these are the
+  three numbers to change (`deploy/docker-compose.yml`'s `prometheus`/`grafana`/`console` port mappings).
+
 ## Windows/Git Bash gotchas
 
 These cost real time to find once; don't rediscover them.
@@ -288,7 +338,8 @@ These cost real time to find once; don't rediscover them.
 | 3 — Stream processing & anomaly detection | `v0.4-phase3` | `internal/window` (Welford's incremental mean/variance + EWMA, count/age-bound sliding window per device/sensor), `internal/rules` (hot-reloadable YAML, `deploy/rules.yaml`), `internal/anomaly` (z-score/rate-of-change/silence detectors with M-consecutive hysteresis), `internal/alerts` (firing/acknowledged/resolved state machine, Postgres + `alerts.*` JetStream publish) — wired into `cmd/processor` as a second durable consumer of TELEMETRY (`windowed.go`) alongside the Phase 2 persistence consumer. `POST /v1/alerts/{id}/ack`/`/resolve` HTTP endpoints are deliberately deferred to Phase 4's `cmd/control` REST API. |
 | 4 — Control plane & device shadow | `v0.5-phase4` | `internal/shadow` (JetStream KV desired/reported state, Postgres audit mirror, retained MQTT publish, state-report reconciler), JWT auth + role hierarchy in `cmd/control` (no login endpoint — `control jwt create` CLI, matching the existing `token create` pattern), device/shadow/drift/alert-ack REST endpoints, runtime config (sample rate/enabled sensors/batching) applied live in `cmd/hostagent` and the PWA (whose hand-rolled MQTT client gained SUBSCRIBE/incoming-PUBLISH support), and `internal/rollout` (staged rollout engine — cohort selection, stage/bake advancement, health-based auto-rollback via `internal/alerts`/`devices.last_seen`/rejection signals, Postgres-backed restart resumption). |
 | 5 — Console | `v0.6-phase5` | `web/console` (Next.js + TypeScript + Tailwind), NextAuth login backed by a real `POST /v1/auth/login` + `internal/users` (`control user create` CLI), role-gated fleet/device-detail/alerts/rollouts views behind a server-side BFF proxy, `GET /v1/ws` (live `metrics.>`/`alerts.>`/`rollout.>` fan-out off NATS with reconnect-with-backoff and a visible degraded-connection state), client-side chart downsampling, and `GET /v1/alerts` (the first alert-listing endpoint, alongside the existing ack/resolve). See "Console (Phase 5)" above. |
-| 6+ | *(not started)* | Full observability, synthetic fleet + chaos testing, hardening, ESP32 firmware. |
+| 6 — Full observability | `v0.7-phase6` | Prometheus scraping `ingest`/`processor`/`control` (the latter's first `/metrics`, on its own plain-HTTP port); `cmd/control`'s first OTel tracing plus a new `control.ws_relay` span extending a reading's trace through the WS relay; JetStream consumer-lag gauges on both `cmd/processor` consumers; Grafana provisioned entirely as code (`deploy/grafana`) — 3 dashboards (fleet-health, pipeline-latency, alerts) and 3 SLO alert rules (ingest p99 lag, end-to-end p99 latency, consumer lag). See "Observability (Phase 6)" above. |
+| 7+ | *(not started)* | Synthetic fleet + chaos testing, hardening, ESP32 firmware. |
 
 ## Where the full plan lives
 
