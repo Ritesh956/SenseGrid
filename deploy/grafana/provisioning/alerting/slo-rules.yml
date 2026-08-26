@@ -1,0 +1,102 @@
+# Phase 6 SLOs — the "did we meet our own bar" section the blueprint asks
+# for. Three targets, each a Grafana-managed alert rule (queries the
+# `prometheus` datasource directly — see ../datasources/prometheus.yml for
+# why its uid is fixed rather than auto-generated; no separate
+# Alertmanager container, this project has no on-call/paging need to
+# justify one):
+#
+#   1. Ingest p99 lag < 500ms       — device → broker-receive, the fastest
+#      hop, so its budget is the tightest.
+#   2. End-to-end p99 latency < 2s  — device publish → durably queryable in
+#      TimescaleDB, the Phase 2 baseline metric.
+#   3. Processor consumer lag < 100 pending — a leading indicator: this
+#      breaching before the latency SLOs do means the processor is falling
+#      behind, not just individually slow.
+apiVersion: 1
+
+groups:
+  - orgId: 1
+    name: slo
+    folder: SenseGrid
+    interval: 1m
+    rules:
+      - uid: sensegrid-slo-ingest-lag-p99
+        title: "SLO: ingest p99 lag < 500ms"
+        condition: threshold
+        for: 5m
+        noDataState: NoData
+        execErrState: Error
+        labels:
+          slo: ingest_lag_p99
+        annotations:
+          summary: "Ingest p99 lag (broker_receive_time - device_time) has exceeded 500ms for 5 minutes."
+        data:
+          - refId: query
+            relativeTimeRange: { from: 300, to: 0 }
+            datasourceUid: prometheus
+            model:
+              refId: query
+              expr: histogram_quantile(0.99, sum(rate(sensegrid_ingest_lag_seconds_bucket[5m])) by (le))
+          - refId: threshold
+            relativeTimeRange: { from: 300, to: 0 }
+            datasourceUid: "-100"
+            model:
+              refId: threshold
+              type: threshold
+              expression: query
+              conditions:
+                - evaluator: { type: gt, params: [0.5] }
+
+      - uid: sensegrid-slo-e2e-latency-p99
+        title: "SLO: end-to-end p99 latency < 2s"
+        condition: threshold
+        for: 5m
+        noDataState: NoData
+        execErrState: Error
+        labels:
+          slo: end_to_end_latency_p99
+        annotations:
+          summary: "End-to-end p99 latency (device publish -> durably queryable) has exceeded 2s for 5 minutes."
+        data:
+          - refId: query
+            relativeTimeRange: { from: 300, to: 0 }
+            datasourceUid: prometheus
+            model:
+              refId: query
+              expr: histogram_quantile(0.99, sum(rate(sensegrid_processor_end_to_end_latency_seconds_bucket[5m])) by (le))
+          - refId: threshold
+            relativeTimeRange: { from: 300, to: 0 }
+            datasourceUid: "-100"
+            model:
+              refId: threshold
+              type: threshold
+              expression: query
+              conditions:
+                - evaluator: { type: gt, params: [2] }
+
+      - uid: sensegrid-slo-consumer-lag
+        title: "SLO: processor consumer lag < 100 pending"
+        condition: threshold
+        for: 5m
+        noDataState: NoData
+        execErrState: Error
+        labels:
+          slo: processor_consumer_lag
+        annotations:
+          summary: "The persistence consumer's pending-message count has exceeded 100 for 5 minutes — the processor is falling behind."
+        data:
+          - refId: query
+            relativeTimeRange: { from: 60, to: 0 }
+            datasourceUid: prometheus
+            model:
+              refId: query
+              expr: max(sensegrid_processor_consumer_lag)
+          - refId: threshold
+            relativeTimeRange: { from: 60, to: 0 }
+            datasourceUid: "-100"
+            model:
+              refId: threshold
+              type: threshold
+              expression: query
+              conditions:
+                - evaluator: { type: gt, params: [100] }

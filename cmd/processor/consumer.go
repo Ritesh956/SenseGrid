@@ -29,6 +29,12 @@ const (
 	batchSize     = 100
 	batchMaxDelay = 500 * time.Millisecond
 	consumerName  = "persistence"
+
+	// consumerLagPollInterval is deliberately its own ticker, not folded
+	// into batchMaxDelay's — lag polling is a Consumer.Info round trip to
+	// JetStream, unrelated to (and much less latency-sensitive than) the
+	// batch flush cadence.
+	consumerLagPollInterval = 5 * time.Second
 )
 
 // flatRow is one row bound for the readings hypertable. A scalar Reading
@@ -93,6 +99,8 @@ func (c *consumer) run(ctx context.Context, js jetstream.JetStream) error {
 
 	ticker := time.NewTicker(batchMaxDelay)
 	defer ticker.Stop()
+	lagTicker := time.NewTicker(consumerLagPollInterval)
+	defer lagTicker.Stop()
 	for {
 		select {
 		case <-ctx.Done():
@@ -100,8 +108,23 @@ func (c *consumer) run(ctx context.Context, js jetstream.JetStream) error {
 			return nil
 		case <-ticker.C:
 			c.flush(ctx)
+		case <-lagTicker.C:
+			c.pollLag(ctx, cons)
 		}
 	}
+}
+
+// pollLag sets the consumer_lag gauge from JetStream's own view of how far
+// behind this consumer is (NumPending: delivered-or-deliverable messages
+// not yet acked) — Phase 6's one genuinely new signal, everything else this
+// phase adds is exposure of metrics that already existed.
+func (c *consumer) pollLag(ctx context.Context, cons jetstream.Consumer) {
+	info, err := cons.Info(ctx)
+	if err != nil {
+		c.logger.Warn("processor: polling consumer info for lag gauge failed", "err", err)
+		return
+	}
+	c.metrics.consumerLag.Set(float64(info.NumPending))
 }
 
 func (c *consumer) onMessage(msg jetstream.Msg) {

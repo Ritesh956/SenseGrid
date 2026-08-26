@@ -81,6 +81,8 @@ func (c *windowedConsumer) run(ctx context.Context, js jetstream.JetStream) erro
 
 	sweep := time.NewTicker(c.sweepInterval)
 	defer sweep.Stop()
+	lagTicker := time.NewTicker(consumerLagPollInterval)
+	defer lagTicker.Stop()
 	for {
 		select {
 		case <-ctx.Done():
@@ -90,6 +92,13 @@ func (c *windowedConsumer) run(ctx context.Context, js jetstream.JetStream) erro
 			evicted := c.registry.Sweep(time.Now(), c.registryTTL)
 			c.metrics.registryEvictions.Add(float64(evicted))
 			c.metrics.registrySize.Set(float64(c.registry.Size()))
+		case <-lagTicker.C:
+			info, err := cons.Info(ctx)
+			if err != nil {
+				c.logger.Warn("processor: polling consumer info for lag gauge failed", "err", err)
+				continue
+			}
+			c.metrics.consumerLag.Set(float64(info.NumPending))
 		}
 	}
 }

@@ -22,6 +22,14 @@ type Config struct {
 	HTTPTLSKeyFile  string
 	ShutdownTimeout time.Duration
 
+	// MetricsAddr is cmd/control's Phase 6 /metrics port — deliberately
+	// separate from HTTPAddr (which serves HTTPS with the dev CA cert):
+	// Prometheus scrapes it over the plain Docker-internal network, so
+	// there's no reason to make it trust that cert too. cmd/ingest and
+	// cmd/processor don't need this field — their /metrics already
+	// piggybacks on their (plain HTTP) HTTPAddr.
+	MetricsAddr string
+
 	MQTTBrokerURL   string
 	MQTTAdminUser   string
 	MQTTAdminPass   string
@@ -91,6 +99,7 @@ func Load(serviceName, defaultHTTPAddr string) Config {
 		HTTPTLSCertFile: getEnv("HTTP_TLS_CERT_FILE", ""),
 		HTTPTLSKeyFile:  getEnv("HTTP_TLS_KEY_FILE", ""),
 		ShutdownTimeout: getDuration("SHUTDOWN_TIMEOUT", 10*time.Second),
+		MetricsAddr:     getEnv("METRICS_ADDR", ":9091"),
 
 		MQTTBrokerURL:   getEnv("MQTT_BROKER_URL", "tls://localhost:8883"),
 		MQTTAdminUser:   getEnv("MQTT_ADMIN_USERNAME", ""),

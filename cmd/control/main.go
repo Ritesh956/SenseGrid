@@ -7,7 +7,11 @@
 // Phase 3), and a staged rollout engine (internal/rollout) that pushes
 // shadow config to a growing percentage of a device cohort over a
 // sequence of bake periods, auto-advancing while healthy and
-// auto-rolling-back on breach.
+// auto-rolling-back on breach. Phase 5 adds the console's login endpoint
+// (auth_login.go) and its live WS feed (ws_handler.go). Phase 6 adds
+// tracing (internal/tracing, matching cmd/ingest/cmd/processor's existing
+// pattern) and a second, plain-HTTP /metrics server (metrics.go) — the
+// first Prometheus instrumentation this service has had.
 package main
 
 import (
@@ -23,6 +27,7 @@ import (
 	mqtt "github.com/eclipse/paho.mqtt.golang"
 	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
@@ -37,6 +42,7 @@ import (
 	"github.com/Ritesh956/SenseGrid/internal/rollout"
 	"github.com/Ritesh956/SenseGrid/internal/shadow"
 	"github.com/Ritesh956/SenseGrid/internal/tlsutil"
+	"github.com/Ritesh956/SenseGrid/internal/tracing"
 	"github.com/Ritesh956/SenseGrid/internal/users"
 )
 
@@ -79,6 +85,13 @@ func runServer() {
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
 	defer stop()
+
+	shutdownTracing, err := tracing.Init(ctx, cfg.ServiceName, cfg.OTLPEndpoint)
+	if err != nil {
+		logger.Error("tracing: init", "err", err)
+		os.Exit(1)
+	}
+	defer func() { _ = shutdownTracing(context.Background()) }()
 
 	tokens := devicestore.New(cfg.RedisAddr)
 	defer tokens.Close()
@@ -173,13 +186,27 @@ func runServer() {
 	}
 	go rolloutEngine.Run(ctx, cfg.RolloutTickInterval)
 
+	m := newMetrics()
+	go runActiveDevicesGauge(ctx, deviceStore, m, cfg.DriftStaleAfter, cfg.RolloutTickInterval, logger)
+
+	metricsSrv, metricsMux := httpserver.New(cfg.MetricsAddr)
+	metricsMux.Handle("/metrics", promhttp.Handler())
+	go func() {
+		// No cert files: this is a plain-HTTP endpoint by design, scraped
+		// only over the internal Docker network — see internal/config's
+		// doc comment on MetricsAddr for why it doesn't share cfg.HTTPAddr.
+		if err := httpserver.Run(ctx, metricsSrv, cfg.ShutdownTimeout, "", "", logger); err != nil {
+			logger.Error("metrics server exited with error", "err", err)
+		}
+	}()
+
 	srv, mux := httpserver.New(cfg.HTTPAddr)
 	registerClaimHandler(mux, logger, tokens, deviceStore, dynsecClient)
 	registerDeviceHandlers(mux, logger, deviceStore, shadowStore, shadowPub, cfg.DriftStaleAfter, cfg.JWTIssuer, signingKey)
 	registerAlertHandlers(mux, logger, alertsStore, alertsPub, cfg.JWTIssuer, signingKey)
 	registerRolloutHandlers(mux, logger, rolloutEngine, cfg.JWTIssuer, signingKey)
 	registerAuthHandlers(mux, logger, userStore, cfg.JWTIssuer, signingKey, cfg.JWTConsoleTTL)
-	registerWSHandler(mux, logger, nc, cfg.JWTIssuer, signingKey)
+	registerWSHandler(mux, logger, nc, m, cfg.JWTIssuer, signingKey)
 	registerStaticFiles(mux)
 
 	if err := httpserver.Run(ctx, srv, cfg.ShutdownTimeout, cfg.HTTPTLSCertFile, cfg.HTTPTLSKeyFile, logger); err != nil {

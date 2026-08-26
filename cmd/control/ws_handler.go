@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"log/slog"
 	"net/http"
@@ -9,6 +10,8 @@ import (
 
 	"github.com/gorilla/websocket"
 	"github.com/nats-io/nats.go"
+
+	"github.com/Ritesh956/SenseGrid/internal/tracing"
 )
 
 const (
@@ -42,12 +45,33 @@ type wsFrame struct {
 	TS      int64           `json:"ts"`
 }
 
+// traceMetricRelay adds one more hop to a reading's trace: internal/window's
+// MetricEvent carries the trace_id of the reading it was computed from
+// (AlertEvent/RolloutEvent don't — confirmed, no bridging attempted for
+// those two frame kinds), so a metrics.> message reaching a console viewer
+// is the last server-side point before the browser. Phases before this one
+// already got the trace to processor.persist/processor.window
+// (cmd/processor); this is what makes it "browsable end-to-end ... device
+// → console" per the Phase 6 DoD, short of adding a browser OTel SDK, which
+// would be scope creep for this phase.
+func traceMetricRelay(payload []byte) {
+	var evt struct {
+		TraceID string `json:"trace_id"`
+	}
+	if err := json.Unmarshal(payload, &evt); err != nil || evt.TraceID == "" {
+		return
+	}
+	_, span := tracing.Tracer("sensegrid/control").Start(
+		tracing.ContextWithReadingTrace(context.Background(), evt.TraceID), "control.ws_relay")
+	span.End()
+}
+
 // registerWSHandler wires GET /v1/ws — the Phase 5 console's live feed.
 // Auth is a ?token= query param, not an Authorization header: a browser's
 // WebSocket API can't set custom headers on the handshake request, so this
 // reuses verifyToken (the same claims check requireRole's header path
 // uses) directly instead of going through verifyBearer.
-func registerWSHandler(mux *http.ServeMux, logger *slog.Logger, nc *nats.Conn, issuer string, signingKey []byte) {
+func registerWSHandler(mux *http.ServeMux, logger *slog.Logger, nc *nats.Conn, m *metrics, issuer string, signingKey []byte) {
 	upgrader := websocket.Upgrader{
 		ReadBufferSize:  1024,
 		WriteBufferSize: 1024,
@@ -71,7 +95,7 @@ func registerWSHandler(mux *http.ServeMux, logger *slog.Logger, nc *nats.Conn, i
 			logger.Warn("ws: upgrade failed", "err", err)
 			return
 		}
-		serveWSConn(conn, nc, logger)
+		serveWSConn(conn, nc, m, logger)
 	})
 }
 
@@ -82,8 +106,11 @@ func registerWSHandler(mux *http.ServeMux, logger *slog.Logger, nc *nats.Conn, i
 // writer goroutine (gorilla requires one goroutine per connection doing
 // writes), and ping/pong keepalive so a dead peer — in either direction —
 // is noticed within wsPongWait, not "eventually".
-func serveWSConn(conn *websocket.Conn, nc *nats.Conn, logger *slog.Logger) {
+func serveWSConn(conn *websocket.Conn, nc *nats.Conn, m *metrics, logger *slog.Logger) {
 	defer conn.Close()
+
+	m.wsClientsConnected.Inc()
+	defer m.wsClientsConnected.Dec()
 
 	send := make(chan []byte, wsSendBuffer)
 	closed := make(chan struct{})
@@ -92,6 +119,9 @@ func serveWSConn(conn *websocket.Conn, nc *nats.Conn, logger *slog.Logger) {
 
 	relay := func(kind string) nats.MsgHandler {
 		return func(msg *nats.Msg) {
+			if kind == "metric" {
+				traceMetricRelay(msg.Data)
+			}
 			frame, err := json.Marshal(wsFrame{
 				Type: kind, Subject: msg.Subject, Payload: msg.Data, TS: time.Now().UnixMilli(),
 			})

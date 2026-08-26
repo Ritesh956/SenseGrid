@@ -1,0 +1,14 @@
+# uid is fixed (not left to Grafana's auto-generated default) because
+# deploy/grafana/provisioning/alerting/slo-rules.yml references it
+# explicitly as datasourceUid — a random UID would break that reference on
+# every fresh provision.
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    uid: prometheus
+    type: prometheus
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: true
+    editable: false

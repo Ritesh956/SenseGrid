@@ -14,6 +14,7 @@ type windowedMetrics struct {
 	alertsResolved    prometheus.Counter
 	registrySize      prometheus.Gauge
 	registryEvictions prometheus.Counter
+	consumerLag       prometheus.Gauge
 }
 
 func newWindowedMetrics() *windowedMetrics {
@@ -50,10 +51,14 @@ func newWindowedMetrics() *windowedMetrics {
 			Namespace: "sensegrid", Subsystem: "processor", Name: "window_registry_evictions_total",
 			Help: "Windows evicted from the registry for exceeding the silent-device TTL.",
 		}),
+		consumerLag: prometheus.NewGauge(prometheus.GaugeOpts{
+			Namespace: "sensegrid", Subsystem: "processor", Name: "windowed_consumer_lag",
+			Help: "NumPending on the windowed consumer (\"windowing\") — messages delivered but not yet acked, polled periodically via Consumer.Info.",
+		}),
 	}
 	prometheus.MustRegister(
 		m.messagesConsumed, m.metricsPublished, m.publishErrors, m.detectorEvals,
-		m.alertsFired, m.alertsResolved, m.registrySize, m.registryEvictions,
+		m.alertsFired, m.alertsResolved, m.registrySize, m.registryEvictions, m.consumerLag,
 	)
 	return m
 }

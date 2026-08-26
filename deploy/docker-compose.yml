@@ -6,6 +6,8 @@ volumes:
   nats_data:
   timescale_data:
   redis_data:
+  prometheus_data:
+  grafana_data:
 
 x-go-service: &go-service
   build:
@@ -116,6 +118,40 @@ services:
       - "16686:16686" # trace query UI
       - "4317:4317" # OTLP gRPC
 
+  prometheus:
+    # Scrapes ingest/processor/control's /metrics (Phase 6) — see
+    # deploy/prometheus/prometheus.yml. Host 9090 (Prometheus' own
+    # default) is commonly already taken by something else on a dev
+    # machine, so it's mapped to 9190 instead, same reasoning as the
+    # console's 3100/3000 mapping (Phase 5).
+    image: prom/prometheus:latest
+    networks: [sensegrid]
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    ports:
+      - "9190:9090"
+
+  grafana:
+    # Dashboards + alert rules provisioned as code (deploy/grafana/**) —
+    # nothing to click through in the UI to reproduce this stack. admin/admin
+    # is fine here, matching this project's existing dev-only-credentials
+    # posture (the dev CA, Mosquitto's hardcoded admin default, etc.).
+    image: grafana/grafana:latest
+    networks: [sensegrid]
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_AUTH_ANONYMOUS_ENABLED: "false"
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana_data:/var/lib/grafana
+    ports:
+      - "3300:3000"
+    depends_on:
+      - prometheus
+
   # --- Go services -----------------------------------------------------
   # hostagent is deliberately not a compose service: it exists to read the
   # *host* machine's real CPU/battery/WiFi metrics (Phase 1), which a
@@ -177,8 +213,10 @@ services:
       MQTT_CONTROL_USERNAME: ${MQTT_CONTROL_USERNAME:-control-plane}
       MQTT_CONTROL_PASSWORD: ${MQTT_CONTROL_PASSWORD:?set MQTT_CONTROL_PASSWORD in .env}
       JWT_SIGNING_KEY: ${JWT_SIGNING_KEY:?set JWT_SIGNING_KEY in .env}
+      METRICS_ADDR: ":9091"
     ports:
       - "8090:8080" # host 8080 was already in use on the dev machine; HTTPS
+      - "9091:9091" # Phase 6 /metrics — plain HTTP, matching ingest/processor's existing host-exposed convention
     depends_on:
       mosquitto:
         condition: service_healthy

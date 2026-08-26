@@ -1,0 +1,22 @@
+# Phase 6 scrape config. Every target is a Docker-network hostname:port —
+# Prometheus lives on the same `sensegrid` network as everything else (see
+# deploy/docker-compose.yml), so none of this depends on host port mappings.
+# cmd/control's target is its separate plain-HTTP metrics port
+# (METRICS_ADDR, :9091 by default), not its HTTPS API port — see
+# internal/config's doc comment on MetricsAddr for why.
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+  - job_name: ingest
+    static_configs:
+      - targets: ["ingest:8081"]
+
+  - job_name: processor
+    static_configs:
+      - targets: ["processor:8082"]
+
+  - job_name: control
+    static_configs:
+      - targets: ["control:9091"]

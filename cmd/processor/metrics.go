@@ -9,6 +9,7 @@ type metrics struct {
 	dbWriteDuration  prometheus.Histogram
 	dbStageLatency   prometheus.Histogram
 	endToEndLatency  prometheus.Histogram
+	consumerLag      prometheus.Gauge
 }
 
 func newMetrics() *metrics {
@@ -41,10 +42,14 @@ func newMetrics() *metrics {
 			Help:    "db_commit_time - device_time: the Phase 2 baseline metric, device publish to durably queryable.",
 			Buckets: prometheus.ExponentialBuckets(0.01, 2, 16),
 		}),
+		consumerLag: prometheus.NewGauge(prometheus.GaugeOpts{
+			Namespace: "sensegrid", Subsystem: "processor", Name: "consumer_lag",
+			Help: "NumPending on the persistence consumer (\"persistence\") — messages delivered but not yet acked, polled periodically via Consumer.Info.",
+		}),
 	}
 	prometheus.MustRegister(
 		m.messagesConsumed, m.batchFailures, m.batchSize,
-		m.dbWriteDuration, m.dbStageLatency, m.endToEndLatency,
+		m.dbWriteDuration, m.dbStageLatency, m.endToEndLatency, m.consumerLag,
 	)
 	return m
 }
