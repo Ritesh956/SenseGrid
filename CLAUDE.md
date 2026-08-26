@@ -10,13 +10,15 @@ and a laptop host agent flows through MQTT → NATS JetStream → TimescaleDB, w
 provisions devices and (from Phase 4 on) pushes config back down to them. Synthetic load only enters
 via `cmd/fleet` (Phase 7), not the primary data path — the phone and laptop are real hardware.
 
-**Current status: Phases 0–6 tagged** (`v0.1-phase0`, `v0.2-phase1`, `v0.3-phase2`, `v0.4-phase3`,
-`v0.5-phase4`, `v0.6-phase5`, `v0.7-phase6`). Phase 6 (full observability) scraped the Prometheus metrics
-Phase 2 already exposed but never scraped, extended tracing and added a `/metrics` port to `cmd/control`
-(the one service that had neither), and provisioned Grafana entirely as code (`deploy/grafana`) —
-3 dashboards and 3 SLO alert rules — see "Observability (Phase 6)" below. Phase 7 (synthetic fleet &
-chaos testing) is next. See "Phase status" below before assuming something isn't built yet — check git
-tags and `internal/` first.
+**Current status: Phases 0–7 tagged** (`v0.1-phase0`, `v0.2-phase1`, `v0.3-phase2`, `v0.4-phase3`,
+`v0.5-phase4`, `v0.6-phase5`, `v0.7-phase6`, `v0.8-phase7`). Phase 7 (synthetic fleet & chaos testing)
+turned `cmd/fleet` from a stub into a real device simulator (claimed identity, MQTT/TLS, config
+subscription, shadow reporting — not a raw publish loop) and added `test/chaos`'s five scripts. A real
+1000-device ramp found the saturation point the phase's DoD calls for (flat latency through 200
+devices, sharp onset at 400→600), and broker-restart/processor-kill/DB-pause/partition runs all
+verified zero data loss — see "Synthetic fleet & chaos testing (Phase 7)" below. Phase 8 (hardening &
+production readiness) is next. See "Phase status" below before assuming something isn't built yet —
+check git tags and `internal/` first.
 
 ## Commands
 
@@ -52,6 +54,15 @@ docker compose -f deploy/docker-compose.yml --env-file .env exec control /app us
 # Prometheus scrape health: http://localhost:9190/targets
 # Grafana (admin/admin), dashboards + alerting provisioned as code: http://localhost:3300
 # — see "Observability (Phase 6)"
+
+# Bulk-issue fleet registration tokens, then scale the fleet up — inert by default (FLEET_TARGET_DEVICES=0),
+# see "Synthetic fleet & chaos testing (Phase 7)"
+export MSYS_NO_PATHCONV=1
+docker compose -f deploy/docker-compose.yml --env-file .env exec control /app token create -name fleet -type fleet -ttl 6h -count 1000 -out /chaos-data/fleet-tokens.txt
+curl -X POST http://localhost:8083/fleet/scale -d '{"count":100}'
+
+# Run the chaos suite (ramp/kill_broker/kill_processor/pause_db/partition) — see test/chaos/README.md
+cd test/chaos && ./ramp.sh
 
 # Run hostagent natively against the compose stack (it is NOT a compose service — see below)
 HOSTAGENT_CLAIM_TOKEN=<token from above> \
@@ -142,7 +153,7 @@ header-based and WS query-param-based paths — see "Console" below). Tokens are
 
 ### Data contract (`internal/telemetry`)
 
-`Reading` is the wire schema every publisher (PWA, hostagent, and eventually fleet/ESP32) uses:
+`Reading` is the wire schema every publisher (PWA, hostagent, fleet, and eventually ESP32) uses:
 `schema_version`, `device_id`, `sensor_type`, **either** `value` (scalar) **or** `values` (map, e.g.
 accelerometer `{x,y,z}` or battery `{level,charging}`), `device_time_ms`, `seq` (monotonic per-device,
 resets on client restart — expected), `trace_id` (32 hex chars, doubles as the OTel trace ID since MQTT
@@ -178,7 +189,7 @@ know before touching it:
 | `cmd/control` | 8090→8080 (HTTPS), 9091 (metrics) | `deploy/docker/control.Dockerfile` | Own Dockerfile: also serves `web/sensor-client` and needs `deploy/migrations`. Since Phase 4 also connects to NATS/JetStream (shadow KV, rollout state/events) and dials the broker itself as the `control` MQTT identity, in addition to the dynsec admin channel. Since Phase 6, `/metrics` is a second, plain-HTTP server on its own port (`METRICS_ADDR`) rather than sharing the HTTPS one — see "Observability" below. |
 | `cmd/ingest` | 8081 | `deploy/docker/go.Dockerfile` (generic) | |
 | `cmd/processor` | 8082 | `deploy/docker/processor.Dockerfile` | Own Dockerfile: needs `deploy/migrations`. |
-| `cmd/fleet` | 8083 | `deploy/docker/go.Dockerfile` (generic) | Stub until Phase 7. |
+| `cmd/fleet` | 8083 | `deploy/docker/go.Dockerfile` (generic) | Phase 7: real device simulator, inert by default (`FLEET_TARGET_DEVICES=0`) until scaled via its own HTTP control API (`/fleet/status`, `/fleet/scale`, `/fleet/partition`, `/fleet/config`) — see "Synthetic fleet & chaos testing" below. |
 | `cmd/hostagent` | 8084 | *(not containerized)* | Runs natively — needs real host CPU/battery/WiFi, which a container can't see. |
 | mosquitto | 8883 (TLS), 9001 (WSS) | `deploy/docker/mosquitto.Dockerfile` | |
 | NATS | 4222, 8222 (monitor) | image | JetStream on. |
@@ -186,14 +197,14 @@ know before touching it:
 | Redis | 6379 | image | Tokens only (see auth model). |
 | Jaeger | 16686 (UI), 4317 (OTLP) | image | Accepts OTLP directly — no separate OTel Collector. |
 | `web/console` | 3100→3000 | `deploy/docker/console.Dockerfile` | Next.js, not a Go binary — see "Console (Phase 5)" above for why it's structured differently from everything else in this table. |
-| Prometheus | 9190→9090 | image | Scrapes `ingest:8081`, `processor:8082`, `control:9091` — see `deploy/prometheus/prometheus.yml` and "Observability" below. |
+| Prometheus | 9190→9090 | image | Scrapes `ingest:8081`, `processor:8082`, `control:9091`, `fleet:8083` (Phase 7) — see `deploy/prometheus/prometheus.yml` and "Observability"/"Synthetic fleet & chaos testing" below. |
 | Grafana | 3300→3000 | image | Dashboards + alert rules provisioned as code from `deploy/grafana/`, admin/admin. |
 
 Shared `internal/` packages, briefly: `config` (env-driven `Config` struct, one `Load()` per service),
 `logging` (slog JSON), `httpserver` (health server + graceful shutdown, optional TLS), `tlsutil` (dev
 CA loading, shared by anything dialing the broker/API directly), `dynsec` (the dynamic-security control
 protocol client — see auth model), `provisioning` (claim-flow client for native Go edge clients:
-`hostagent` now, `fleet` later), `devices` (Postgres device registry), `devicestore` (Redis
+`hostagent` and `fleet`), `devices` (Postgres device registry), `devicestore` (Redis
 registration tokens only), `telemetry` (wire schema + JetStream subject naming), `tracing` (OTel
 wiring + the trace_id-to-SpanContext bridge), `migrations` (see above).
 
@@ -292,6 +303,53 @@ since Phase 2 too.
   console's 3100 mapping (Phase 5). If you hit a port conflict on a different machine, these are the
   three numbers to change (`deploy/docker-compose.yml`'s `prometheus`/`grafana`/`console` port mappings).
 
+### Synthetic fleet & chaos testing (Phase 7)
+
+`cmd/fleet` is a real device simulator, not a raw publish loop: each virtual device (`device.go`)
+claims its own identity via `internal/provisioning` (bulk-issued tokens — `control token create
+-count N`, this phase's addition to `token.go`), connects over MQTT/TLS, subscribes to its own config
+topic, and reports shadow state exactly like `cmd/hostagent` does — the same `applyPartial`/
+`appliedConfig` pattern, duplicated rather than shared since the two binaries' sensor sets differ.
+Signals (`signal.go`) are sinusoidal + drift + gaussian noise + step changes + rate-gated anomaly
+spikes, across three sensors (`temperature`, `humidity`, and a vector `accel` — exercising both the
+scalar and vector-flattening paths the "Data contract" section above describes). Misbehavior
+(malformed payloads, latency jitter, clock skew, voluntary disconnects) is a live-tunable
+`runtimeConfig` (`POST /fleet/config`), off by default.
+
+- **Unlike every other compose service, `cmd/fleet` starts inert** (`FLEET_TARGET_DEVICES` defaults to
+  0) — it's not part of the primary data path (see "What this is" above), so a fresh `docker compose up`
+  shouldn't generate load. `manager.go`'s `FleetManager.Scale` brings it up/down on request
+  (`POST /fleet/scale`), staggering new connections over `FLEET_RAMP_WINDOW` so a big jump doesn't open
+  hundreds of TCP handshakes at once, and reuses a scaled-down device's cached credentials
+  (`FLEET_STATE_DIR`, a bind mount — see below) rather than burning a fresh registration token on every
+  restart.
+- **Simulated network partition, not real network manipulation**: since a fleet of any size runs as
+  goroutines inside one process rather than one container per device, `POST /fleet/partition`
+  (`device.go`'s `sampleLoop`) just disconnects that device's own MQTT client for the requested
+  duration and reconnects it on a timer — the realistic failure mode for a synthetic fleet is "the
+  client's own connection drops." This also naturally exercises the retained-publish config channel: a
+  config pushed while a device is partitioned is picked up immediately on reconnect via the existing
+  resubscribe, no special-casing needed.
+- **`chaos_data`/`fleet_data` are host bind mounts, not named Docker volumes** (see
+  `deploy/docker-compose.yml`): `control` and `fleet` both run as distroless nonroot (uid 65532), and a
+  fresh named volume is created root-owned with no `chown` mechanism available (no shell in the image)
+  — found live as a `permission denied` writing the token file. Same reason `./certs` is already a bind
+  mount rather than a volume.
+- **`test/chaos`** has five scripts (`ramp.sh`, `kill_broker.sh`, `kill_processor.sh`, `pause_db.sh`,
+  `partition.sh`) driving `cmd/fleet`'s control API and Docker directly (broker restart, processor
+  SIGKILL, DB pause), each writing a timestamped CSV to `results/` (gitignored — reproducible run
+  output, not committed) plus `render_charts.py` turning those into the P10 report charts. See
+  `test/chaos/README.md`.
+- **A real 1000-device ramp found the saturation point the P7 DoD asks for**: latency stays flat
+  (~0.3–0.6s p99) through 200 devices, then saturates sharply at 400→600 — `sensegrid_ingest_lag_seconds`
+  (the ingest bridge's own processing lag, not something downstream) jumps in lockstep with end-to-end
+  p99, implicating the single-instance ingest bridge (no horizontal scaling) as the bottleneck resource
+  rather than the broker or TimescaleDB, consistent with ~900 msg/s (600 devices × 3 sensors / 2s
+  sample interval) approaching one Go process's ceiling.
+- Also found running the chaos scripts against a real stack: `GET /v1/devices/drift`
+  (`cmd/control/devices_handlers.go`) marshaled a nil slice to JSON `null` instead of `[]` when nothing
+  had drifted, breaking any consumer doing `.devices[]` — fixed to `drifted := []deviceView{}`.
+
 ## Windows/Git Bash gotchas
 
 These cost real time to find once; don't rediscover them.
@@ -327,6 +385,31 @@ These cost real time to find once; don't rediscover them.
 - **Docker Desktop isn't always running.** `docker info` failing with a `dockerDesktopLinuxEngine` pipe
   error means the daemon isn't up, not that Docker is broken — start Docker Desktop and wait
   (`until docker info >/dev/null 2>&1; do sleep 5; done`).
+- **`MSYS_NO_PATHCONV` is all-or-nothing per command line, not per-argument** (found writing
+  `test/chaos`'s scripts). Exporting it globally to stop `docker compose exec ... /app ...`'s
+  container-internal path from being rewritten (see the first gotcha above) also stops `docker
+  compose`'s own `-f`/`--env-file` *host* paths from being converted, corrupting them into
+  `C:\c\Users\...` instead of erroring cleanly. Fix: pre-convert those two paths once via `cygpath -w`
+  (`test/chaos/lib.sh`), so the global export becomes safe for both at once.
+- **`docker compose exec` forwards the calling shell's stdin by default, even with `-T`.** Called from
+  inside a `while read ... done <<< "$multiline_var"` loop, it silently drains the *rest* of the
+  here-string on its first invocation — no error, the loop just quietly runs once instead of N times.
+  `test/chaos/lib.sh`'s `compose()` wrapper redirects `< /dev/null` for exactly this reason; none of
+  its callers need real stdin anyway.
+- **Multi-line `jq -r` output can carry an embedded `\r` per line** somewhere in the curl/docker/jq
+  chain on this platform, which `read -r`/`mapfile` both preserve (they don't strip CRs, only disable
+  backslash escaping). Invisible in a terminal; turns a syntactically valid UUID into one Postgres
+  rejects outright. Strip with `| tr -d '\r'` right after any multi-line `jq -r` call feeding a loop or
+  an exact-match comparison — single-value extractions via plain `$(...)` are unaffected, since command
+  substitution's trailing-newline trim happens to eat a trailing `\r\n` too; it's only *internal* CRs
+  between lines that survive.
+- **`curl.exe`'s `-o /dev/null` intermittently exits 23 ("write error") on this platform**, and a
+  `curl` call can fail with exit 56 ("recv error") against a service that's fully healthy a moment
+  later, especially once `cmd/fleet` is pushing real load (seen at 200+ simulated devices). Avoid
+  `-o /dev/null` (fold the response body and a `-w` status code into one captured stream instead), and
+  wrap any network call a long-running script depends on in a retry with backoff
+  (`test/chaos/lib.sh`'s `curl_retry`) — under `set -e`, one transient failure otherwise takes down an
+  entire multi-minute chaos run.
 
 ## Phase status
 
@@ -339,7 +422,8 @@ These cost real time to find once; don't rediscover them.
 | 4 — Control plane & device shadow | `v0.5-phase4` | `internal/shadow` (JetStream KV desired/reported state, Postgres audit mirror, retained MQTT publish, state-report reconciler), JWT auth + role hierarchy in `cmd/control` (no login endpoint — `control jwt create` CLI, matching the existing `token create` pattern), device/shadow/drift/alert-ack REST endpoints, runtime config (sample rate/enabled sensors/batching) applied live in `cmd/hostagent` and the PWA (whose hand-rolled MQTT client gained SUBSCRIBE/incoming-PUBLISH support), and `internal/rollout` (staged rollout engine — cohort selection, stage/bake advancement, health-based auto-rollback via `internal/alerts`/`devices.last_seen`/rejection signals, Postgres-backed restart resumption). |
 | 5 — Console | `v0.6-phase5` | `web/console` (Next.js + TypeScript + Tailwind), NextAuth login backed by a real `POST /v1/auth/login` + `internal/users` (`control user create` CLI), role-gated fleet/device-detail/alerts/rollouts views behind a server-side BFF proxy, `GET /v1/ws` (live `metrics.>`/`alerts.>`/`rollout.>` fan-out off NATS with reconnect-with-backoff and a visible degraded-connection state), client-side chart downsampling, and `GET /v1/alerts` (the first alert-listing endpoint, alongside the existing ack/resolve). See "Console (Phase 5)" above. |
 | 6 — Full observability | `v0.7-phase6` | Prometheus scraping `ingest`/`processor`/`control` (the latter's first `/metrics`, on its own plain-HTTP port); `cmd/control`'s first OTel tracing plus a new `control.ws_relay` span extending a reading's trace through the WS relay; JetStream consumer-lag gauges on both `cmd/processor` consumers; Grafana provisioned entirely as code (`deploy/grafana`) — 3 dashboards (fleet-health, pipeline-latency, alerts) and 3 SLO alert rules (ingest p99 lag, end-to-end p99 latency, consumer lag). See "Observability (Phase 6)" above. |
-| 7+ | *(not started)* | Synthetic fleet + chaos testing, hardening, ESP32 firmware. |
+| 7 — Synthetic fleet & chaos testing | `v0.8-phase7` | `cmd/fleet` turned into a real device simulator (claimed identity, MQTT/TLS, config subscription, shadow reporting, sinusoidal+drift+noise+anomaly signals across scalar/vector sensors, live-tunable misbehavior), inert by default and driven by its own HTTP control API (`/fleet/scale`, `/fleet/partition`, `/fleet/config`) instead of per-device containers; bulk token issuance (`control token create -count`); `test/chaos`'s five scripts (ramp/kill_broker/kill_processor/pause_db/partition) plus a chart renderer. A real 1000-device ramp found the saturation point (flat through 200 devices, sharp onset at 400–600, implicating the single-instance ingest bridge); broker-restart/processor-kill/DB-pause/partition runs all verified zero data loss. See "Synthetic fleet & chaos testing (Phase 7)" above. |
+| 8+ | *(not started)* | Hardening & production readiness, ESP32 firmware, report & submission artifacts. |
 
 ## Where the full plan lives
 
