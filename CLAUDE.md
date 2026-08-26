@@ -10,12 +10,13 @@ and a laptop host agent flows through MQTT → NATS JetStream → TimescaleDB, w
 provisions devices and (from Phase 4 on) pushes config back down to them. Synthetic load only enters
 via `cmd/fleet` (Phase 7), not the primary data path — the phone and laptop are real hardware.
 
-**Current status: Phases 0–4 tagged** (`v0.1-phase0`, `v0.2-phase1`, `v0.3-phase2`, `v0.4-phase3`,
-`v0.5-phase4`). Phase 4 (control plane & device shadow) added `internal/shadow` (JetStream KV device
-shadow), JWT-gated REST endpoints and CLI token issuance in `cmd/control`, runtime edge config in
-`cmd/hostagent`/the PWA, and `internal/rollout` (staged rollout engine: cohort selection, stage/bake
-advancement, health-based auto-rollback, restart resumption). Phase 5 (console) is next. See "Phase
-status" below before assuming something isn't built yet — check git tags and `internal/` first.
+**Current status: Phases 0–5 tagged** (`v0.1-phase0`, `v0.2-phase1`, `v0.3-phase2`, `v0.4-phase3`,
+`v0.5-phase4`, `v0.6-phase5`). Phase 5 (console) added `web/console` (Next.js + TypeScript + Tailwind,
+NextAuth login), a real `POST /v1/auth/login` backed by `internal/users` (`control user create` CLI,
+mirroring the existing CLI-only provisioning pattern), a `GET /v1/ws` live feed off NATS, and
+`GET /v1/alerts` — the first alert-listing endpoint, alongside the existing ack/resolve — see "Console
+(Phase 5)" below. Phase 6 (full observability) is next. See "Phase status" below before assuming
+something isn't built yet — check git tags and `internal/` first.
 
 ## Commands
 
@@ -42,8 +43,11 @@ docker compose -f deploy/docker-compose.yml --env-file .env down -v    # wipe vo
 export MSYS_NO_PATHCONV=1
 docker compose -f deploy/docker-compose.yml --env-file .env exec control /app token create -name my-device -type laptop -ttl 1h
 
-# Mint a JWT for the Phase 4 REST API (also CLI-only — see "Auth model")
+# Mint a JWT for the REST API (also CLI-only — see "REST API auth")
 docker compose -f deploy/docker-compose.yml --env-file .env exec control /app jwt create -role admin -ttl 1h
+
+# Provision the first console login (admin CLI, not an HTTP endpoint — see "REST API auth")
+docker compose -f deploy/docker-compose.yml --env-file .env exec control /app user create -username admin -role admin -password <password>
 
 # Run hostagent natively against the compose stack (it is NOT a compose service — see below)
 HOSTAGENT_CLAIM_TOKEN=<token from above> \
@@ -112,15 +116,22 @@ foreign key downstream, in a completely different service.
 
 ### REST API auth (JWT — a separate system from the MQTT auth model above)
 
-`cmd/control`'s HTTP endpoints (device/shadow/drift, alert ack/resolve, rollouts) are gated by
-HMAC-signed (HS256) JWT bearer tokens, not MQTT dynsec — three roles, treated as a hierarchy
-(`admin` > `operator` > `viewer`; higher satisfies a lower-role requirement), verified by
-`cmd/control/auth.go`'s `requireRole` middleware. **There is no login endpoint and no password/user
-store** — Phase 4 never needed one, and building one ahead of Phase 5's actual console login would
-have been speculative. Tokens are minted with the `control jwt create -role <role> [-ttl 1h]` CLI
-(`cmd/control/jwt_cli.go`), mirroring `token create`'s existing CLI-only pattern: shell access to the
-binary is the auth boundary. A real login endpoint (password or NextAuth-backed) is Phase 5's job, once
-the console needs one to call — don't add one preemptively.
+`cmd/control`'s HTTP endpoints (device/shadow/drift, alert list/ack/resolve, rollouts, and the Phase 5
+`GET /v1/ws` feed) are gated by HMAC-signed (HS256) JWT bearer tokens, not MQTT dynsec — three roles,
+treated as a hierarchy (`admin` > `operator` > `viewer`; higher satisfies a lower-role requirement),
+verified by `cmd/control/auth.go`'s `requireRole` middleware (`verifyToken` underneath, shared by the
+header-based and WS query-param-based paths — see "Console" below). Tokens are minted two ways:
+
+- `control jwt create -role <role> [-ttl 1h]` CLI (`cmd/control/jwt_cli.go`), no subject, mirroring
+  `token create`'s CLI-only pattern — shell access to the binary is the auth boundary. Short-lived by
+  default (`JWT_ACCESS_TTL`, 15m) since it's meant for scripted/automation use.
+- `POST /v1/auth/login` (`cmd/control/auth_login.go`, Phase 5) — bcrypt-checked against `internal/users`
+  (a real Postgres table, provisioned the same CLI-only way: `control user create -username <u> -role
+  <role> -password <p>`), minting the *same* role-only JWT shape `requireRole` already verifies, just
+  with a subject (username) and a separately-configurable, longer TTL (`JWT_CONSOLE_TTL`, 12h default —
+  kept distinct from `JWT_ACCESS_TTL` so CLI tokens stay short-lived without forcing an interactive
+  console user to re-login every 15 minutes). This is the console's only identity system; there is no
+  separate NextAuth user store on the frontend side (see "Console" below).
 
 ### Data contract (`internal/telemetry`)
 
@@ -167,6 +178,7 @@ know before touching it:
 | TimescaleDB | 5432 | `deploy/docker/timescaledb.Dockerfile` | |
 | Redis | 6379 | image | Tokens only (see auth model). |
 | Jaeger | 16686 (UI), 4317 (OTLP) | image | Accepts OTLP directly — no separate OTel Collector. |
+| `web/console` | 3100→3000 | `deploy/docker/console.Dockerfile` | Next.js, not a Go binary — see "Console (Phase 5)" above for why it's structured differently from everything else in this table. |
 
 Shared `internal/` packages, briefly: `config` (env-driven `Config` struct, one `Load()` per service),
 `logging` (slog JSON), `httpserver` (health server + graceful shutdown, optional TLS), `tlsutil` (dev
@@ -188,6 +200,47 @@ once at `https://<lan-ip>:9001/` (the second one shows a blank/error page after 
 expected, the goal is just registering the TLS exception for that origin). `LAN_IP=<ip> bash
 scripts/gen-certs.sh` (after removing `deploy/certs/control.*`) adds the LAN IP to the cert's SAN so
 only the untrusted-CA warning shows, not also a hostname mismatch.
+
+### Console (Phase 5, `web/console`)
+
+A Next.js + TypeScript + Tailwind app, separate from `web/sensor-client` (the Phase 1 vanilla-JS PWA)
+and built as its own Docker service (`deploy/docker/console.Dockerfile`, host port `3100`→container
+`3000` — 3000 itself is commonly already taken by something else on a dev machine, so it's mapped away
+by default rather than assumed free). Two things make it structurally different from every other
+service in this repo:
+
+- **It talks to `cmd/control` through its own server-side BFF** (`src/app/api/**` route handlers), not
+  directly from the browser — every REST call is proxied server-side with the session's bearer token
+  attached, which is what lets `cmd/control` keep its existing "no CORS to configure" property even
+  though the console is a separate origin. The one exception is the **live WebSocket**
+  (`GET /v1/ws`, `cmd/control/ws_handler.go`), which connects browser-to-control directly (WS isn't
+  subject to CORS) — this needs `wss://` and the same one-time dev-CA-trust click already required for
+  the phone (see "TLS" above), and needs the *host-exposed* URL (`NEXT_PUBLIC_CONTROL_WS_URL`), not the
+  Docker-internal one the BFF uses (`CONTROL_API_URL`) — the browser can't resolve the `control`
+  hostname. The WS handler itself just subscribes core NATS (`metrics.>`/`alerts.>`/`rollout.>`) per
+  connection and relays — no new publish-side plumbing, and no durability/replay need since the console
+  only wants this feed live.
+- **NextAuth (Auth.js v5) owns login**, calling `POST /v1/auth/login` server-side and holding the
+  resulting control-plane JWT in the session (JWT strategy — see "REST API auth" above; no separate
+  NextAuth identity store). Two Next.js-specific things bit during setup, worth knowing before touching
+  auth config again: `NEXT_PUBLIC_*` env vars are inlined into the client bundle at **build** time, not
+  read at container start, so `NEXT_PUBLIC_CONTROL_WS_URL` has to be a Docker build arg
+  (`console.Dockerfile` + `docker-compose.yml`'s `build.args`), not a runtime `environment:` entry, or it
+  silently does nothing; and Auth.js only trusts the incoming request's `Host` header automatically on
+  Vercel — every other deployment (this one included) needs `trustHost: true` in `src/auth.ts`, or every
+  request 307-redirect-loops between `/` and `/login` with an `UntrustedHost` error visible only in the
+  container's own logs, never the browser. Both found live, not theoretical.
+
+The console charts `internal/window`'s `MetricEvent` (windowed mean/EWMA), not raw `telemetry.Reading`
+— see that package's doc comment, which earmarks it for exactly this. Device-shadow desired/reported
+state is **not** on the WS feed (it's MQTT retained-publish only, never republished to NATS — see "Auth
+model" above); the device-detail page polls `GET /v1/devices/{id}/shadow` instead, on a short interval.
+
+`web/console/go.mod` is a deliberate no-op module boundary, not a stray file — some npm packages
+(observed: `flatted`, pulled in transitively) ship a stray `.go` file inside `node_modules`, which the
+root module's `go build ./...`/`go test ./...` would otherwise walk into and pick up. A `go.mod` here
+(nothing ever imports it) marks the whole subtree as a separate module, which the root module's `...`
+pattern skips automatically. Found live after `npm install` in this directory, not theoretical.
 
 ## Windows/Git Bash gotchas
 
@@ -234,7 +287,8 @@ These cost real time to find once; don't rediscover them.
 | 2 — Ingest, persistence, tracing | `v0.3-phase2` | `cmd/ingest` bridge, `cmd/processor` batched persistence, TimescaleDB schema + continuous aggregates + compression/retention, OTel tracing to Jaeger, Prometheus histograms (exposed, not yet scraped — that's Phase 6). |
 | 3 — Stream processing & anomaly detection | `v0.4-phase3` | `internal/window` (Welford's incremental mean/variance + EWMA, count/age-bound sliding window per device/sensor), `internal/rules` (hot-reloadable YAML, `deploy/rules.yaml`), `internal/anomaly` (z-score/rate-of-change/silence detectors with M-consecutive hysteresis), `internal/alerts` (firing/acknowledged/resolved state machine, Postgres + `alerts.*` JetStream publish) — wired into `cmd/processor` as a second durable consumer of TELEMETRY (`windowed.go`) alongside the Phase 2 persistence consumer. `POST /v1/alerts/{id}/ack`/`/resolve` HTTP endpoints are deliberately deferred to Phase 4's `cmd/control` REST API. |
 | 4 — Control plane & device shadow | `v0.5-phase4` | `internal/shadow` (JetStream KV desired/reported state, Postgres audit mirror, retained MQTT publish, state-report reconciler), JWT auth + role hierarchy in `cmd/control` (no login endpoint — `control jwt create` CLI, matching the existing `token create` pattern), device/shadow/drift/alert-ack REST endpoints, runtime config (sample rate/enabled sensors/batching) applied live in `cmd/hostagent` and the PWA (whose hand-rolled MQTT client gained SUBSCRIBE/incoming-PUBLISH support), and `internal/rollout` (staged rollout engine — cohort selection, stage/bake advancement, health-based auto-rollback via `internal/alerts`/`devices.last_seen`/rejection signals, Postgres-backed restart resumption). |
-| 5+ | *(not started)* | Console, full observability, synthetic fleet + chaos testing, hardening, ESP32 firmware. |
+| 5 — Console | `v0.6-phase5` | `web/console` (Next.js + TypeScript + Tailwind), NextAuth login backed by a real `POST /v1/auth/login` + `internal/users` (`control user create` CLI), role-gated fleet/device-detail/alerts/rollouts views behind a server-side BFF proxy, `GET /v1/ws` (live `metrics.>`/`alerts.>`/`rollout.>` fan-out off NATS with reconnect-with-backoff and a visible degraded-connection state), client-side chart downsampling, and `GET /v1/alerts` (the first alert-listing endpoint, alongside the existing ack/resolve). See "Console (Phase 5)" above. |
+| 6+ | *(not started)* | Full observability, synthetic fleet + chaos testing, hardening, ESP32 firmware. |
 
 ## Where the full plan lives
 
