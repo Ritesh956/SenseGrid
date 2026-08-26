@@ -130,6 +130,26 @@ func (s *Store) Acknowledge(ctx context.Context, id string) (*Alert, error) {
 	return a, nil
 }
 
+// FiringCountForDevices counts how many of deviceIDs have at least one
+// alert that has been firing since (opened at or after) since — the
+// "error rate" signal Phase 4's rollout engine (internal/rollout) uses to
+// decide whether a stage is healthy, reusing Phase 3's alert data instead
+// of a parallel error-tracking mechanism.
+func (s *Store) FiringCountForDevices(ctx context.Context, deviceIDs []string, since time.Time) (int, error) {
+	if len(deviceIDs) == 0 {
+		return 0, nil
+	}
+	var count int
+	err := s.pool.QueryRow(ctx, `
+		SELECT count(DISTINCT device_id) FROM alerts
+		WHERE device_id = ANY($1::uuid[]) AND state = 'firing' AND fired_at >= $2`,
+		deviceIDs, since).Scan(&count)
+	if err != nil {
+		return 0, fmt.Errorf("alerts: counting firing for devices: %w", err)
+	}
+	return count, nil
+}
+
 func (s *Store) getOpen(ctx context.Context, deviceID, sensorType, ruleName string) (*Alert, error) {
 	row := s.pool.QueryRow(ctx, `
 		SELECT `+alertColumns+`

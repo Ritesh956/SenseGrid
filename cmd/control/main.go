@@ -2,9 +2,12 @@
 // (CLI-issued tokens + POST /v1/devices/claim) and the PWA's static files.
 // Phase 4 adds: JWT-gated REST endpoints (auth.go), the device shadow —
 // JetStream KV-backed desired/reported config, retained-published to
-// devices and reconciled from their state reports (internal/shadow) — and
+// devices and reconciled from their state reports (internal/shadow) —
 // alert ack/resolve (reusing internal/alerts, built for cmd/processor in
-// Phase 3). Staged rollouts are a separate follow-up phase, not here yet.
+// Phase 3), and a staged rollout engine (internal/rollout) that pushes
+// shadow config to a growing percentage of a device cohort over a
+// sequence of bake periods, auto-advancing while healthy and
+// auto-rolling-back on breach.
 package main
 
 import (
@@ -31,6 +34,7 @@ import (
 	"github.com/Ritesh956/SenseGrid/internal/httpserver"
 	"github.com/Ritesh956/SenseGrid/internal/logging"
 	"github.com/Ritesh956/SenseGrid/internal/migrations"
+	"github.com/Ritesh956/SenseGrid/internal/rollout"
 	"github.com/Ritesh956/SenseGrid/internal/shadow"
 	"github.com/Ritesh956/SenseGrid/internal/tlsutil"
 )
@@ -125,6 +129,13 @@ func runServer() {
 	alertsStore := alerts.NewStore(pool)
 	alertsPub := alerts.NewPublisher(js)
 
+	if err := rollout.EnsureStream(ctx, js); err != nil {
+		logger.Error("rollout: ensuring stream", "err", err)
+		os.Exit(1)
+	}
+	rolloutStore := rollout.NewStore(pool)
+	rolloutPub := rollout.NewPublisher(js)
+
 	reconciler := shadow.NewReconciler(shadowStore, deviceStore, logger)
 	controlMQTT, err := connectControlMQTT(cfg, logger, reconciler)
 	var shadowPub *shadow.Publisher
@@ -135,10 +146,29 @@ func runServer() {
 		shadowPub = shadow.NewPublisher(controlMQTT)
 	}
 
+	// shadowPub is a *shadow.Publisher that may be nil (MQTT connect
+	// failed above); assigning it directly to the DevicePublisher
+	// interface parameter would produce a non-nil interface wrapping a
+	// nil pointer (the classic Go typed-nil gotcha), which
+	// rollout.Engine's own nil check couldn't catch. Only assign the
+	// interface variable when the pointer is genuinely non-nil, so a
+	// failed MQTT connect degrades the rollout engine the same way it
+	// already degrades PUT /v1/devices/{id}/shadow/desired.
+	var rolloutDevicePub rollout.DevicePublisher
+	if shadowPub != nil {
+		rolloutDevicePub = shadowPub
+	}
+	rolloutEngine := rollout.NewEngine(rolloutStore, shadowStore, rolloutDevicePub, deviceStore, alertsStore, rolloutPub, cfg.RolloutDisconnectStaleAfter, logger)
+	if err := rolloutEngine.ResumeAll(ctx); err != nil {
+		logger.Error("rollout: resuming in-flight rollouts failed", "err", err)
+	}
+	go rolloutEngine.Run(ctx, cfg.RolloutTickInterval)
+
 	srv, mux := httpserver.New(cfg.HTTPAddr)
 	registerClaimHandler(mux, logger, tokens, deviceStore, dynsecClient)
 	registerDeviceHandlers(mux, logger, deviceStore, shadowStore, shadowPub, cfg.DriftStaleAfter, cfg.JWTIssuer, signingKey)
 	registerAlertHandlers(mux, logger, alertsStore, alertsPub, cfg.JWTIssuer, signingKey)
+	registerRolloutHandlers(mux, logger, rolloutEngine, cfg.JWTIssuer, signingKey)
 	registerStaticFiles(mux)
 
 	if err := httpserver.Run(ctx, srv, cfg.ShutdownTimeout, cfg.HTTPTLSCertFile, cfg.HTTPTLSKeyFile, logger); err != nil {

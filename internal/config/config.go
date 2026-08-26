@@ -49,6 +49,14 @@ type Config struct {
 	// applied_revision matched — see internal/shadow.Drift.
 	DriftStaleAfter time.Duration
 
+	// RolloutTickInterval/RolloutDisconnectStaleAfter — internal/rollout's
+	// Engine (Phase 4 Pass B). Disconnect staleness is independently
+	// configurable from DriftStaleAfter above even though they default to
+	// the same value: a rollout's health bar and the shadow drift view are
+	// different concerns that happen to start from the same number.
+	RolloutTickInterval         time.Duration
+	RolloutDisconnectStaleAfter time.Duration
+
 	RulesFile           string
 	RulesReloadInterval time.Duration
 
@@ -94,6 +102,9 @@ func Load(serviceName, defaultHTTPAddr string) Config {
 		JWTAccessTTL:  getDuration("JWT_ACCESS_TTL", 15*time.Minute),
 
 		DriftStaleAfter: getDuration("SHADOW_DRIFT_STALE_AFTER", 2*time.Minute),
+
+		RolloutTickInterval:         getDuration("ROLLOUT_TICK_INTERVAL", 10*time.Second),
+		RolloutDisconnectStaleAfter: getDuration("ROLLOUT_DISCONNECT_STALE_AFTER", 2*time.Minute),
 
 		RulesFile:           getEnv("RULES_FILE", "deploy/rules.yaml"),
 		RulesReloadInterval: getDuration("RULES_RELOAD_INTERVAL", 5*time.Second),

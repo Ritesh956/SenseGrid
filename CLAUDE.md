@@ -10,10 +10,11 @@ and a laptop host agent flows through MQTT → NATS JetStream → TimescaleDB, w
 provisions devices and (from Phase 4 on) pushes config back down to them. Synthetic load only enters
 via `cmd/fleet` (Phase 7), not the primary data path — the phone and laptop are real hardware.
 
-**Current status: Phases 0–3 tagged** (`v0.1-phase0`, `v0.2-phase1`, `v0.3-phase2`, `v0.4-phase3`).
-Phase 3 (windowed stream processing + anomaly detection) added `internal/window`, `internal/rules`,
-`internal/anomaly`, `internal/alerts`, and `cmd/processor`'s second durable consumer (`windowed.go`).
-Phase 4 (control plane & device shadow) is next. See "Phase
+**Current status: Phases 0–4 tagged** (`v0.1-phase0`, `v0.2-phase1`, `v0.3-phase2`, `v0.4-phase3`,
+`v0.5-phase4`). Phase 4 (control plane & device shadow) added `internal/shadow` (JetStream KV device
+shadow), JWT-gated REST endpoints and CLI token issuance in `cmd/control`, runtime edge config in
+`cmd/hostagent`/the PWA, and `internal/rollout` (staged rollout engine: cohort selection, stage/bake
+advancement, health-based auto-rollback, restart resumption). Phase 5 (console) is next. See "Phase
 status" below before assuming something isn't built yet — check git tags and `internal/` first.
 
 ## Commands
@@ -40,6 +41,9 @@ docker compose -f deploy/docker-compose.yml --env-file .env down -v    # wipe vo
 # Issue a device registration token (admin CLI, not an HTTP endpoint — see "Auth model")
 export MSYS_NO_PATHCONV=1
 docker compose -f deploy/docker-compose.yml --env-file .env exec control /app token create -name my-device -type laptop -ttl 1h
+
+# Mint a JWT for the Phase 4 REST API (also CLI-only — see "Auth model")
+docker compose -f deploy/docker-compose.yml --env-file .env exec control /app jwt create -role admin -ttl 1h
 
 # Run hostagent natively against the compose stack (it is NOT a compose service — see below)
 HOSTAGENT_CLAIM_TOKEN=<token from above> \
@@ -84,19 +88,20 @@ hostagent (Go) ─┴─► Mosquitto (dynamic-security auth) ┘         │   
 ### Auth model (dynamic-security plugin — read this before touching anything MQTT-related)
 
 Mosquitto has **no anonymous access anywhere**. Auth is entirely via the `dynamic-security` plugin,
-controlled at runtime over MQTT itself (`$CONTROL/dynamic-security/v1`), not config files. Three
+controlled at runtime over MQTT itself (`$CONTROL/dynamic-security/v1`), not config files. Four
 identities exist, each provisioned differently:
 
 | Identity | Created by | Scope |
 |---|---|---|
-| **admin** | `deploy/mosquitto/entrypoint.sh` at first boot (offline, `mosquitto_ctrl dynsec init`) | Full control-channel access. Used only by `cmd/control` (`internal/dynsec`) to bootstrap the two roles below. |
+| **admin** | `deploy/mosquitto/entrypoint.sh` at first boot (offline, `mosquitto_ctrl dynsec init`) | Full control-channel access. Used only by `cmd/control` (`internal/dynsec`) to bootstrap the three roles below. |
 | **device** (role) | `cmd/control` at startup, idempotent | Every claimed device gets this role. ACLs use `%c` substitution — a device can only touch `sensegrid/v1/{its-own-id}/*`. `username == clientid == device_id`, enforced by dynsec's `clientid` pinning on `createClient`. |
 | **bridge** (role) | `cmd/control` at startup, idempotent | `cmd/ingest` connects as this (`MQTT_BRIDGE_USERNAME`/`PASSWORD` in `.env`, shared secret — **not** claimed at runtime like a device). ACL is a literal wildcard filter (`subscribeLiteral` on `sensegrid/v1/+/telemetry`), because a service needs to read *every* device's topic, which `%c` substitution can't express. |
+| **control** (role) | `cmd/control` at startup, idempotent (Phase 4) | `cmd/control` itself connects as this (`MQTT_CONTROL_USERNAME`/`PASSWORD` in `.env`) to retained-publish desired shadow config to any device's `.../config` topic and wildcard-subscribe every device's `.../state` topic (`internal/shadow.Publisher`/`Reconciler`) — same wildcard-ACL reasoning as bridge, just publish-side instead of subscribe-side for config. |
 
-**A new service that needs its own broker access** (e.g. Phase 4's control-plane MQTT client) needs a
-new role + a new `MQTT_<X>_USERNAME/PASSWORD` pair added to `connectDynsec` in `cmd/control/main.go`
-and `.env.example`, following the bridge pattern — do not reuse the bridge or device roles for a
-different purpose.
+**A new service that needs its own broker access** needs a new role + a new
+`MQTT_<X>_USERNAME/PASSWORD` pair added to `connectDynsec` in `cmd/control/main.go` and
+`.env.example`, following the bridge/control pattern — do not reuse an existing role for a different
+purpose.
 
 Device provisioning flow (`cmd/control/claim.go`): registration token (Redis, `internal/devicestore`,
 single-use, TTL'd) → `POST /v1/devices/claim` → **Postgres `devices` row created first**, dynsec
@@ -104,6 +109,18 @@ single-use, TTL'd) → `POST /v1/devices/claim` → **Postgres `devices` row cre
 inert unclaimed device_id (harmless). The reverse order would let a device authenticate and publish
 with no `devices` row, and every one of its readings would silently fail the `readings.device_id`
 foreign key downstream, in a completely different service.
+
+### REST API auth (JWT — a separate system from the MQTT auth model above)
+
+`cmd/control`'s HTTP endpoints (device/shadow/drift, alert ack/resolve, rollouts) are gated by
+HMAC-signed (HS256) JWT bearer tokens, not MQTT dynsec — three roles, treated as a hierarchy
+(`admin` > `operator` > `viewer`; higher satisfies a lower-role requirement), verified by
+`cmd/control/auth.go`'s `requireRole` middleware. **There is no login endpoint and no password/user
+store** — Phase 4 never needed one, and building one ahead of Phase 5's actual console login would
+have been speculative. Tokens are minted with the `control jwt create -role <role> [-ttl 1h]` CLI
+(`cmd/control/jwt_cli.go`), mirroring `token create`'s existing CLI-only pattern: shell access to the
+binary is the auth boundary. A real login endpoint (password or NextAuth-backed) is Phase 5's job, once
+the console needs one to call — don't add one preemptively.
 
 ### Data contract (`internal/telemetry`)
 
@@ -140,7 +157,7 @@ know before touching it:
 
 | Binary | Port | Dockerfile | Notes |
 |---|---|---|---|
-| `cmd/control` | 8090→8080 (HTTPS) | `deploy/docker/control.Dockerfile` | Own Dockerfile: also serves `web/sensor-client` and needs `deploy/migrations`. |
+| `cmd/control` | 8090→8080 (HTTPS) | `deploy/docker/control.Dockerfile` | Own Dockerfile: also serves `web/sensor-client` and needs `deploy/migrations`. Since Phase 4 also connects to NATS/JetStream (shadow KV, rollout state/events) and dials the broker itself as the `control` MQTT identity, in addition to the dynsec admin channel. |
 | `cmd/ingest` | 8081 | `deploy/docker/go.Dockerfile` (generic) | |
 | `cmd/processor` | 8082 | `deploy/docker/processor.Dockerfile` | Own Dockerfile: needs `deploy/migrations`. |
 | `cmd/fleet` | 8083 | `deploy/docker/go.Dockerfile` (generic) | Stub until Phase 7. |
@@ -216,7 +233,8 @@ These cost real time to find once; don't rediscover them.
 | 1 — Edge clients & provisioning | `v0.2-phase1` | PWA sensor client (hand-rolled MQTT-over-WS, no MQTT.js dependency), device claim flow, Mosquitto dynamic-security auth, `cmd/hostagent` real CPU/mem/battery/WiFi metrics. |
 | 2 — Ingest, persistence, tracing | `v0.3-phase2` | `cmd/ingest` bridge, `cmd/processor` batched persistence, TimescaleDB schema + continuous aggregates + compression/retention, OTel tracing to Jaeger, Prometheus histograms (exposed, not yet scraped — that's Phase 6). |
 | 3 — Stream processing & anomaly detection | `v0.4-phase3` | `internal/window` (Welford's incremental mean/variance + EWMA, count/age-bound sliding window per device/sensor), `internal/rules` (hot-reloadable YAML, `deploy/rules.yaml`), `internal/anomaly` (z-score/rate-of-change/silence detectors with M-consecutive hysteresis), `internal/alerts` (firing/acknowledged/resolved state machine, Postgres + `alerts.*` JetStream publish) — wired into `cmd/processor` as a second durable consumer of TELEMETRY (`windowed.go`) alongside the Phase 2 persistence consumer. `POST /v1/alerts/{id}/ack`/`/resolve` HTTP endpoints are deliberately deferred to Phase 4's `cmd/control` REST API. |
-| 4+ | *(not started)* | Control plane device shadow, staged rollouts, console, full observability, synthetic fleet + chaos testing, hardening, ESP32 firmware. |
+| 4 — Control plane & device shadow | `v0.5-phase4` | `internal/shadow` (JetStream KV desired/reported state, Postgres audit mirror, retained MQTT publish, state-report reconciler), JWT auth + role hierarchy in `cmd/control` (no login endpoint — `control jwt create` CLI, matching the existing `token create` pattern), device/shadow/drift/alert-ack REST endpoints, runtime config (sample rate/enabled sensors/batching) applied live in `cmd/hostagent` and the PWA (whose hand-rolled MQTT client gained SUBSCRIBE/incoming-PUBLISH support), and `internal/rollout` (staged rollout engine — cohort selection, stage/bake advancement, health-based auto-rollback via `internal/alerts`/`devices.last_seen`/rejection signals, Postgres-backed restart resumption). |
+| 5+ | *(not started)* | Console, full observability, synthetic fleet + chaos testing, hardening, ESP32 firmware. |
 
 ## Where the full plan lives
 

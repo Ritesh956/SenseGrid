@@ -30,6 +30,12 @@ const (
 	// consumer of its own alert-clearing logic. See cmd/processor/jetstream.go.
 	MetricsStreamName = "METRICS"
 	AlertsStreamName  = "ALERTS"
+
+	// RolloutsStreamName is created by cmd/control (Phase 4 Pass B), which
+	// is both the producer and sole subscriber of its own stage-transition
+	// events today — a future console (Phase 5) is the intended second
+	// subscriber.
+	RolloutsStreamName = "ROLLOUTS"
 )
 
 // Reading is one sensor sample. Use Value for a scalar reading (e.g. CPU
@@ -131,6 +137,12 @@ func MetricsSubject(deviceID string) string {
 // resolve events are published to for a device.
 func AlertsSubject(deviceID string) string {
 	return "alerts." + deviceID
+}
+
+// RolloutEventsSubject returns the JetStream subject a staged rollout's
+// stage-transition and health-check events are published to.
+func RolloutEventsSubject(rolloutID string) string {
+	return "rollout." + rolloutID + ".events"
 }
 
 // NewTraceID returns a W3C trace-id shaped correlation id: 32 lowercase
