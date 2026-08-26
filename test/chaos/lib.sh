@@ -82,25 +82,45 @@ psql_query() {
 	compose exec -T timescaledb psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -tA -c "$1"
 }
 
+# curl_retry retries a curl invocation up to 5 times with a short backoff.
+# Found live: at 200+ devices, a single transient network hiccup (curl
+# exit 56, "recv error" — the fleet and Prometheus were both healthy a
+# moment later) took down an otherwise-clean 20+ minute ramp run under
+# set -e. Same stdout/exit-status contract as a bare curl call, just more
+# patient about one bad moment; a call that's STILL failing after 5 tries
+# is a real problem and is meant to propagate.
+curl_retry() {
+	local tries=5 delay=2 i
+	for ((i = 1; i <= tries; i++)); do
+		if curl "$@"; then
+			return 0
+		fi
+		if [ "$i" -lt "$tries" ]; then
+			sleep "$delay"
+		fi
+	done
+	return 1
+}
+
 fleet_status() {
-	curl -sf "$FLEET_URL/fleet/status"
+	curl_retry -sf "$FLEET_URL/fleet/status"
 }
 
 fleet_scale() {
 	local count="$1"
-	curl -sf -X POST "$FLEET_URL/fleet/scale" -H 'Content-Type: application/json' \
+	curl_retry -sf -X POST "$FLEET_URL/fleet/scale" -H 'Content-Type: application/json' \
 		-d "{\"count\":$count}"
 }
 
 fleet_partition() {
 	local count="$1" duration_ms="$2"
-	curl -sf -X POST "$FLEET_URL/fleet/partition" -H 'Content-Type: application/json' \
+	curl_retry -sf -X POST "$FLEET_URL/fleet/partition" -H 'Content-Type: application/json' \
 		-d "{\"count\":$count,\"duration_ms\":$duration_ms}"
 }
 
 fleet_config() {
 	local body="$1"
-	curl -sf -X POST "$FLEET_URL/fleet/config" -H 'Content-Type: application/json' -d "$body"
+	curl_retry -sf -X POST "$FLEET_URL/fleet/config" -H 'Content-Type: application/json' -d "$body"
 }
 
 # wait_for_connected polls fleet/status until at least `fraction` of target
@@ -132,13 +152,13 @@ wait_for_connected() {
 prom_quantile() {
 	local metric="$1" quantile="$2" range="${3:-1m}"
 	local query="histogram_quantile(${quantile}, sum(rate(${metric}_bucket[${range}])) by (le))"
-	curl -sf --data-urlencode "query=$query" "$PROMETHEUS_URL/api/v1/query" \
+	curl_retry -sf --data-urlencode "query=$query" "$PROMETHEUS_URL/api/v1/query" \
 		| jq -r '.data.result[0].value[1] // "NaN"'
 }
 
 prom_scalar() {
 	local query="$1"
-	curl -sf --data-urlencode "query=$query" "$PROMETHEUS_URL/api/v1/query" \
+	curl_retry -sf --data-urlencode "query=$query" "$PROMETHEUS_URL/api/v1/query" \
 		| jq -r '.data.result[0].value[1] // "NaN"'
 }
 
