@@ -278,11 +278,51 @@ func connectControlMQTT(cfg config.Config, logger *slog.Logger, reconciler *shad
 // A failure here is logged, not fatal: /healthz still succeeds so the
 // container isn't killed over a broker hiccup, but the claim endpoint
 // returns 503 until it recovers (see claim.go).
+//
+// Retries a few times with a short flat backoff before giving up: a
+// single "createRole: no response within 10s" right after a mosquitto
+// restart used to leave device claiming disabled (503 on every
+// POST /v1/devices/claim) for control's entire remaining lifetime,
+// recoverable only by a manual restart. The actual race behind that has
+// since been fixed at the source — internal/dynsec.Connect() used to
+// return before its response-topic subscription was confirmed, so a
+// command issued immediately after (every caller's first move) could
+// have its response published while nobody was listening yet — but this
+// retry stays as defense-in-depth for the class of problem it's actually
+// suited to: mosquitto genuinely not accepting connections yet, a slow
+// TLS handshake, or any other transient dependency-not-ready-at-startup
+// hiccup that a fresh attempt a few seconds later resolves on its own.
+// The config-missing case above returns before any of that, deliberately
+// not retried: a missing env var isn't going to fix itself between
+// attempts, so retrying it would only add pointless startup delay.
+// attemptDynsecBootstrap does the actual connect+bootstrap work.
 func connectDynsec(ctx context.Context, cfg config.Config, logger *slog.Logger) *dynsec.Client {
 	if cfg.MQTTAdminUser == "" || cfg.MQTTAdminPass == "" {
 		logger.Warn("MQTT_ADMIN_USERNAME/MQTT_ADMIN_PASSWORD not set, device claim endpoint will stay disabled")
 		return nil
 	}
+
+	const maxAttempts = 3
+	const retryDelay = 3 * time.Second
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		if client := attemptDynsecBootstrap(ctx, cfg, logger); client != nil {
+			return client
+		}
+		if attempt == maxAttempts {
+			break
+		}
+		logger.Warn("dynsec: bootstrap attempt failed, retrying", "attempt", attempt, "max_attempts", maxAttempts, "retry_in", retryDelay)
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-time.After(retryDelay):
+		}
+	}
+	logger.Error("dynsec: bootstrap did not succeed after retries, device claims will stay disabled until control is restarted", "max_attempts", maxAttempts)
+	return nil
+}
+
+func attemptDynsecBootstrap(ctx context.Context, cfg config.Config, logger *slog.Logger) *dynsec.Client {
 	client, err := dynsec.Connect(dynsec.Config{
 		BrokerURL: cfg.MQTTBrokerURL,
 		CAFile:    cfg.TLSCAFile,

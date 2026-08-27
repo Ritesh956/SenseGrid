@@ -98,6 +98,12 @@ func Connect(cfg Config) (*Client, error) {
 		SetConnectTimeout(cfg.Timeout).
 		SetAutoReconnect(true).
 		SetOnConnectHandler(func(mc mqtt.Client) {
+			// Fire-and-forget is fine here: this handler only matters for
+			// surviving a *later* reconnect (clean sessions, the default,
+			// don't persist subscriptions across a dropped connection).
+			// The synchronous Subscribe below is what guarantees the
+			// first command a caller issues right after Connect()
+			// returns isn't lost.
 			mc.Subscribe(responseTopic, 1, c.handleResponse)
 		})
 
@@ -116,6 +122,28 @@ func Connect(cfg Config) (*Client, error) {
 	}
 	if err := token.Error(); err != nil {
 		return nil, fmt.Errorf("dynsec: connect: %w", err)
+	}
+
+	// Subscribe synchronously before returning: found live (repeatedly,
+	// not a one-off) that without this, a caller issuing a command
+	// immediately after Connect() returns — which every caller does —
+	// races the OnConnectHandler's own async subscribe above. If
+	// mosquitto processes and responds to the command before that
+	// subscribe reaches the broker, the response gets published while
+	// this client isn't listening yet, and the command times out with
+	// nothing in the logs to explain why (it looks identical to the
+	// broker just being slow). This is what cmd/control/main.go's
+	// connectDynsec retry loop was actually working around — retrying
+	// helped because each attempt is a fresh race, not because the
+	// broker needed more time; this fixes the race directly instead.
+	subToken := c.mqtt.Subscribe(responseTopic, 1, c.handleResponse)
+	if !subToken.WaitTimeout(cfg.Timeout) {
+		c.mqtt.Disconnect(250)
+		return nil, fmt.Errorf("dynsec: subscribing to %s timed out", responseTopic)
+	}
+	if err := subToken.Error(); err != nil {
+		c.mqtt.Disconnect(250)
+		return nil, fmt.Errorf("dynsec: subscribing to %s: %w", responseTopic, err)
 	}
 	return c, nil
 }
