@@ -10,15 +10,17 @@ and a laptop host agent flows through MQTT → NATS JetStream → TimescaleDB, w
 provisions devices and (from Phase 4 on) pushes config back down to them. Synthetic load only enters
 via `cmd/fleet` (Phase 7), not the primary data path — the phone and laptop are real hardware.
 
-**Current status: Phases 0–7 tagged** (`v0.1-phase0`, `v0.2-phase1`, `v0.3-phase2`, `v0.4-phase3`,
-`v0.5-phase4`, `v0.6-phase5`, `v0.7-phase6`, `v0.8-phase7`). Phase 7 (synthetic fleet & chaos testing)
-turned `cmd/fleet` from a stub into a real device simulator (claimed identity, MQTT/TLS, config
-subscription, shadow reporting — not a raw publish loop) and added `test/chaos`'s five scripts. A real
-1000-device ramp found the saturation point the phase's DoD calls for (flat latency through 200
-devices, sharp onset at 400→600), and broker-restart/processor-kill/DB-pause/partition runs all
-verified zero data loss — see "Synthetic fleet & chaos testing (Phase 7)" below. Phase 8 (hardening &
-production readiness) is next. See "Phase status" below before assuming something isn't built yet —
-check git tags and `internal/` first.
+**Current status: Phases 0–8 tagged** (`v0.1-phase0`, `v0.2-phase1`, `v0.3-phase2`, `v0.4-phase3`,
+`v0.5-phase4`, `v0.6-phase5`, `v0.7-phase6`, `v0.8-phase7`, `v0.9-phase8`). Phase 8 (hardening &
+production readiness) proved a measured 121s restore RTO against a real 1.3M-row dataset, verified
+compression/retention actually work (92.8% storage saved, lossless) rather than just being configured,
+and found a real bug while load-testing the per-device rate limiter: paho's MQTT client defaults to
+serializing every device's message callback through one goroutine, so a runaway device could starve
+everyone else even though the token bucket is per-device — fixed, and confirmed fixed live. Also
+rotated the dev CA, bumped a CRITICAL-vulnerable `next-auth` (the console's actual login system), and
+cleared every other unaddressed CRITICAL from the Trivy scan across every built image — see "Hardening
+& production readiness (Phase 8)" below. Phase 9 (optional credibility layer — firmware) is next. See
+"Phase status" below before assuming something isn't built yet — check git tags and `internal/` first.
 
 ## Commands
 
@@ -63,6 +65,20 @@ curl -X POST http://localhost:8083/fleet/scale -d '{"count":100}'
 
 # Run the chaos suite (ramp/kill_broker/kill_processor/pause_db/partition) — see test/chaos/README.md
 cd test/chaos && ./ramp.sh
+
+# Run the Phase 8 hardening drills (backup/restore RTO, compression/retention, rate-limiter load test)
+# against a live stack — see "Hardening & production readiness (Phase 8)" below
+cd test/hardening && ./backup_restore.sh          # DESTRUCTIVE: destroys and restores the timescaledb volume
+./compression_retention.sh
+./rate_limit_load.sh
+
+# Vulnerability scan: Go stdlib/deps, then every built image (needs Docker; pulls aquasec/trivy)
+govulncheck ./...
+export MSYS_NO_PATHCONV=1
+for img in ingest processor control fleet mosquitto timescaledb console; do
+  docker run --rm -v /var/run/docker.sock:/var/run/docker.sock -v trivy-cache:/root/.cache/ \
+    aquasec/trivy:latest image --severity CRITICAL,HIGH --scanners vuln "deploy-$img"
+done
 
 # Run hostagent natively against the compose stack (it is NOT a compose service — see below)
 HOSTAGENT_CLAIM_TOKEN=<token from above> \
@@ -350,6 +366,65 @@ scalar and vector-flattening paths the "Data contract" section above describes).
   (`cmd/control/devices_handlers.go`) marshaled a nil slice to JSON `null` instead of `[]` when nothing
   had drifted, breaking any consumer doing `.devices[]` — fixed to `drifted := []deviceView{}`.
 
+### Hardening & production readiness (Phase 8)
+
+The phase the original brief skipped entirely — turning "it worked in the chaos test" into "here's
+what we'd trust in production." Full evidence and numbers: `docs/phase8-hardening-report.md`. One-page
+on-call runbook: `docs/runbook.md`. Reproducible drills: `test/hardening/` (same conventions as
+`test/chaos/` — timestamped CSVs to `results/`, gitignored).
+
+- **Backup/restore drill (`test/hardening/backup_restore.sh`) measured a 121s RTO** against a real
+  1.3M-row dataset (Phase 7's chaos-test data, not a synthetic toy set): `pg_dump`, destroy
+  `deploy_timescale_data` entirely, recreate, `timescaledb_pre_restore()` → `pg_restore` →
+  `timescaledb_post_restore()`, verify. Every row count matched exactly pre/post (readings,
+  `readings_1m`, `readings_1h`, devices, alerts), and compressed-chunk state plus all 6 background jobs
+  survived the restore intact with no extra steps — TimescaleDB's dump/restore already carries
+  continuous-aggregate materializations as regular tables, so "verify aggregates rebuild" turned out to
+  mean "confirm the restore already includes them."
+- **Compression/retention verification (`compression_retention.sh`) doesn't wait out `compress_after`/
+  `drop_after`** (2/7 days — too long for a script): it calls the exact functions the policy jobs call,
+  on demand. Result: **391MB → 28MB (92.8% storage saved), lossless** (row count unchanged), and a
+  synthetic reading backdated 10 days was the only thing retention dropped — real data untouched.
+- **The rate-limiter load test (`rate_limit_load.sh`) found a real bug**, not a hypothetical: paho's
+  MQTT client defaults to `Order: true`, which routes every subscribed message through **one goroutine**
+  so callbacks fire in receive order — `cmd/ingest`'s per-device token bucket (`ratelimit.go`) is
+  correctly scoped per `device_id`, but it's only consulted *after* a message reaches `handle()`, so a
+  flooding device's messages monopolized the one processing goroutine ahead of everyone else's
+  regardless. Measured live: pushing one device to 2000Hz against a 20-device fleet made ingest's p99
+  lag jump 6.7x (19ms→127ms) and the other 19 devices' data **stopped landing in the database entirely
+  for minutes** (their fleet-side sequence counters kept climbing — they were still publishing — while
+  their DB rows stayed byte-identical). Fixed with `SetOrderMatters(false)` in `cmd/ingest/main.go` —
+  nothing in the pipeline depends on delivery order (JetStream publish is idempotent per
+  `(device_id, sensor_type, seq, time)`, and `cmd/processor` already tolerates out-of-order arrival).
+  Confirmed after the fix: normal devices landed 25,490 rows/60s while the rogue was shed at +42,144
+  rate-limited, with no lag regression.
+- **Verifying this by seq gaps (`max(seq) - count(distinct seq)`) is a trap**: `cmd/fleet` reuses cached
+  device credentials across scale up/down, and `Reading.Seq` resets to 0 on every client restart (see
+  the data contract above), so a reused `device_id` can have several non-contiguous seq ranges in
+  `readings` from past test runs — `rate_limit_load.sh` measures by wall-clock time window instead,
+  which isn't affected by that history.
+- **Secrets review**: no committed secrets (grepped for credential-shaped strings across tracked
+  files); `internal/config.Config.LogValue()` already redacts every secret field before structured
+  logging (booleans, not values); `web/sensor-client`'s `localStorage` use is the device's own scoped
+  MQTT credential (intended, same pattern as `~/.sensegrid/hostagent-device.json`), not a leak. The dev
+  CA was rotated (`scripts/gen-certs.sh`, regenerate from scratch) and the whole stack verified
+  end-to-end on the new certs.
+- **Vulnerability scan (govulncheck + npm audit + Trivy on every built image): zero unaddressed
+  CRITICALs.** `web/console`'s `next-auth@5.0.0-beta.25` — the console's actual login system, see
+  "Console (Phase 5)" above — carried multiple CRITICAL auth-bypass CVEs (existence checks failing
+  open, an email-normalizer homoglyph bypass); bumped to `5.0.0-beta.32`. Go stdlib had 8 reachable CVEs
+  from a lagging toolchain, fixed by bumping every Dockerfile's builder to `golang:1.26-alpine` and
+  `go.mod` to match. `mosquitto`/`timescaledb`'s Alpine base layers had 5/4 HIGH CVEs already fixed in
+  Alpine's own repos but not yet in the floating upstream image tags — `apk upgrade` in both
+  Dockerfiles. `console`'s runtime stage switched from `node:22-alpine` to
+  `gcr.io/distroless/nodejs22-debian13:nonroot`, clearing a CRITICAL node-tar CVE (npm's own bundled
+  deps — this image never invokes npm/yarn at runtime) and a CRITICAL OpenSSL CVE that debian12's
+  distroless variant still carried. Two findings remain and are documented (not silently ignored) as
+  accepted/upstream-owned: `timescaledb`'s vendored `gosu`/`timescaledb-tune`/`timescaledb-parallel-copy`
+  binaries (old Go toolchain baked into the official `timescale/timescaledb` image, never executed with
+  network input by our entrypoint) and Next.js's internally-pinned `postcss` (only ever processes this
+  repo's own trusted CSS at build time, never untrusted input at request-serving runtime).
+
 ## Windows/Git Bash gotchas
 
 These cost real time to find once; don't rediscover them.
@@ -423,7 +498,8 @@ These cost real time to find once; don't rediscover them.
 | 5 — Console | `v0.6-phase5` | `web/console` (Next.js + TypeScript + Tailwind), NextAuth login backed by a real `POST /v1/auth/login` + `internal/users` (`control user create` CLI), role-gated fleet/device-detail/alerts/rollouts views behind a server-side BFF proxy, `GET /v1/ws` (live `metrics.>`/`alerts.>`/`rollout.>` fan-out off NATS with reconnect-with-backoff and a visible degraded-connection state), client-side chart downsampling, and `GET /v1/alerts` (the first alert-listing endpoint, alongside the existing ack/resolve). See "Console (Phase 5)" above. |
 | 6 — Full observability | `v0.7-phase6` | Prometheus scraping `ingest`/`processor`/`control` (the latter's first `/metrics`, on its own plain-HTTP port); `cmd/control`'s first OTel tracing plus a new `control.ws_relay` span extending a reading's trace through the WS relay; JetStream consumer-lag gauges on both `cmd/processor` consumers; Grafana provisioned entirely as code (`deploy/grafana`) — 3 dashboards (fleet-health, pipeline-latency, alerts) and 3 SLO alert rules (ingest p99 lag, end-to-end p99 latency, consumer lag). See "Observability (Phase 6)" above. |
 | 7 — Synthetic fleet & chaos testing | `v0.8-phase7` | `cmd/fleet` turned into a real device simulator (claimed identity, MQTT/TLS, config subscription, shadow reporting, sinusoidal+drift+noise+anomaly signals across scalar/vector sensors, live-tunable misbehavior), inert by default and driven by its own HTTP control API (`/fleet/scale`, `/fleet/partition`, `/fleet/config`) instead of per-device containers; bulk token issuance (`control token create -count`); `test/chaos`'s five scripts (ramp/kill_broker/kill_processor/pause_db/partition) plus a chart renderer. A real 1000-device ramp found the saturation point (flat through 200 devices, sharp onset at 400–600, implicating the single-instance ingest bridge); broker-restart/processor-kill/DB-pause/partition runs all verified zero data loss. See "Synthetic fleet & chaos testing (Phase 7)" above. |
-| 8+ | *(not started)* | Hardening & production readiness, ESP32 firmware, report & submission artifacts. |
+| 8 — Hardening & production readiness | `v0.9-phase8` | A measured 121s backup/restore RTO against a real 1.3M-row dataset; compression/retention verified live (92.8% storage saved, lossless) rather than just configured; a real bug found and fixed in the rate limiter (paho's `Order:true` default let a runaway device starve everyone else despite the per-device token bucket — fixed with `SetOrderMatters(false)`, confirmed live before/after); dev CA rotated; zero unaddressed CRITICALs after a govulncheck/npm-audit/Trivy pass across every built image (including a CRITICAL `next-auth` auth-bypass fix in the console). See "Hardening & production readiness (Phase 8)" above. |
+| 9+ | *(not started)* | Optional credibility layer (ESP32 firmware), report & submission artifacts. |
 
 ## Where the full plan lives
 
