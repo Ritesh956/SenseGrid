@@ -5,7 +5,7 @@
 # ruleset, with docker-compose.yml bind-mounting over it so editing the
 # host file demonstrates hot-reload without a rebuild. Build context is the
 # repo root.
-FROM golang:1.25-alpine AS build
+FROM golang:1.26-alpine AS build
 WORKDIR /src
 COPY . .
 RUN CGO_ENABLED=0 GOOS=linux go build -o /out/processor ./cmd/processor

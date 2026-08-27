@@ -1,6 +1,6 @@
 module github.com/Ritesh956/SenseGrid
 
-go 1.25.0
+go 1.26.0
 
 require (
 	github.com/distatus/battery v0.11.0

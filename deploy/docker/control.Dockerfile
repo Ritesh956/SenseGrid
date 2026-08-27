@@ -2,7 +2,7 @@
 # because, unlike most other services, it also serves the PWA sensor
 # client's static files and runs the schema migrations. Build context is
 # the repo root.
-FROM golang:1.25-alpine AS build
+FROM golang:1.26-alpine AS build
 WORKDIR /src
 COPY . .
 RUN CGO_ENABLED=0 GOOS=linux go build -o /out/control ./cmd/control

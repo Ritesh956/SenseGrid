@@ -5,6 +5,11 @@
 # bind-mounted file from a Windows host can't reliably guarantee that.
 FROM timescale/timescaledb:latest-pg16
 
+# Same rationale as mosquitto.Dockerfile's apk upgrade: Phase 8's Trivy scan
+# found 4 HIGH CVEs (libcrypto3/libssl3/sqlite-libs) already fixed in
+# Alpine's own repos but not yet in this floating base tag's last rebuild.
+RUN apk update && apk upgrade --no-cache
+
 COPY deploy/certs/timescaledb.pem /var/lib/postgresql/server.crt
 COPY deploy/certs/timescaledb.key /var/lib/postgresql/server.key
 COPY deploy/certs/ca.pem /var/lib/postgresql/ca.crt

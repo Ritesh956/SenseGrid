@@ -9,9 +9,12 @@ import (
 // perDeviceLimiter is the ingest bridge's backpressure-shedding mechanism:
 // a lazily-created token bucket per device_id. Deliberately simple for
 // Phase 2 — no eviction of long-idle devices' limiters yet. At real-device
-// scale that's a non-issue; Phase 8 explicitly plans to load-test this
-// under the synthetic fleet's device counts, which is the right time to
-// decide whether eviction is actually needed rather than guessing now.
+// scale that's a non-issue; Phase 8's load test (test/hardening/
+// rate_limit_load.sh) exercises this under the synthetic fleet's device
+// counts, which is the right time to decide whether eviction is actually
+// needed rather than guessing now. That test also found this map being
+// per-device was necessary but not sufficient for isolating a runaway
+// device — see main.go's SetOrderMatters(false) for the other half.
 type perDeviceLimiter struct {
 	mu       sync.Mutex
 	limiters map[string]*rate.Limiter

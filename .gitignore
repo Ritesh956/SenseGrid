@@ -25,6 +25,12 @@ test/chaos/fleet-data/*
 test/chaos/results/*
 !test/chaos/results/.gitkeep
 
+# Phase 8 hardening drill output (test/hardening/*.sh) — same reasoning as
+# test/chaos/results/ above, plus these can contain actual pg_dump backups
+# of whatever's in the dev stack at drill time.
+test/hardening/results/*
+!test/hardening/results/.gitkeep
+
 # Node (web/console, web/sensor-client — Phase 5/1)
 web/**/node_modules/
 web/**/.next/

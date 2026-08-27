@@ -4,7 +4,9 @@
 // republishes onto JetStream for cmd/processor to persist. Malformed
 // payloads go to a dead-letter subject instead of being dropped or
 // crashing the service; a per-device token bucket sheds load from a
-// runaway or misbehaving client rather than starving everyone else.
+// runaway or misbehaving client rather than starving everyone else — see
+// connectMQTT's SetOrderMatters(false) call for the part of that isolation
+// that isn't the token bucket itself (Phase 8).
 package main
 
 import (
@@ -104,6 +106,24 @@ func connectMQTT(cfg config.Config, logger *slog.Logger, handler mqtt.MessageHan
 		SetPassword(cfg.MQTTBridgePass).
 		SetTLSConfig(tlsCfg).
 		SetAutoAckDisabled(true). // we ack explicitly once a reading is durably in JetStream (or deliberately dropped)
+		// Order defaults to true, which routes every subscription's
+		// messages through a single goroutine so callbacks fire in
+		// receive order. Found live in Phase 8's rate-limiter load test:
+		// with Order true, one device flooding the shared telemetry
+		// filter monopolizes that single goroutine (JSON unmarshal +
+		// validation run before ratelimit.go's per-device Allow() check
+		// even rejects it), so every other device's messages queue up
+		// behind it — the per-device token bucket can't help because the
+		// messages never reach it in time. handle() doesn't depend on
+		// cross-device or even same-device ordering (JetStream publish
+		// is idempotent per (device_id, sensor_type, seq, time) — see
+		// deploy/migrations/0002_readings.sql — and cmd/processor
+		// tolerates out-of-order arrival), so disabling it and letting
+		// paho dispatch each message on its own goroutine is what
+		// actually gives the rate limiter room to isolate a runaway
+		// device. See test/hardening/rate_limit_load.sh for the
+		// before/after measurement.
+		SetOrderMatters(false).
 		SetConnectTimeout(10 * time.Second).
 		// SetConnectRetry (distinct from SetAutoReconnect) is what makes the
 		// *first* Connect() retry instead of failing outright — needed here
