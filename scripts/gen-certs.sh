@@ -15,11 +15,18 @@ mkdir -p "$CERT_DIR"
 cd "$CERT_DIR"
 
 # LAN_IP: set this to your laptop's LAN IP (e.g. LAN_IP=192.168.1.23) to
-# also cover it in the control-plane cert's SAN, so a phone on the same
-# network sees only an "untrusted CA" warning instead of also a hostname
-# mismatch. Either way the warning is one "proceed anyway" click; this just
-# removes the second one. Re-run with `rm deploy/certs/control.*` first to
-# pick up a changed LAN_IP.
+# also cover it in the control-plane and mosquitto certs' SANs, so a phone
+# or real device on the same network sees only an "untrusted CA" warning
+# instead of also a hostname mismatch. Either way the warning is one
+# "proceed anyway" click for a browser; this just removes the second one —
+# but it's not optional for cmd/hostagent, cmd/fleet, or the Phase 9 ESP32
+# firmware's mosquitto connection specifically, since none of those clients
+# skip hostname/SAN verification the way a browser's click-through can (see
+# internal/tlsutil.FromCAFile / firmware/esp32's WiFiClientSecure — both
+# verify the cert chain against the CA, and mbedTLS's default is stricter
+# about the SAN actually covering the address dialed). Re-run with
+# `rm deploy/certs/mosquitto.* deploy/certs/control.*` first to pick up a
+# changed LAN_IP.
 : "${LAN_IP:=}"
 
 if [ ! -f ca.pem ]; then
@@ -48,12 +55,14 @@ issue() {
 }
 
 echo "issuing service certs..."
-issue mosquitto   "DNS:mosquitto,DNS:localhost,IP:127.0.0.1"
-issue timescaledb "DNS:timescaledb,DNS:localhost,IP:127.0.0.1"
+mosquitto_sans="DNS:mosquitto,DNS:localhost,IP:127.0.0.1"
 control_sans="DNS:control,DNS:localhost,IP:127.0.0.1"
 if [ -n "$LAN_IP" ]; then
+  mosquitto_sans="${mosquitto_sans},IP:${LAN_IP}"
   control_sans="${control_sans},IP:${LAN_IP}"
 fi
+issue mosquitto   "$mosquitto_sans"
+issue timescaledb "DNS:timescaledb,DNS:localhost,IP:127.0.0.1"
 issue control "$control_sans"
 
 echo "done. certs in $CERT_DIR (gitignored, dev-only)."

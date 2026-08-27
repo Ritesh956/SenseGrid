@@ -1,0 +1,36 @@
+{
+  "version": 1,
+  "author": "SenseGrid",
+  "editor": "wokwi",
+  "parts": [
+    {
+      "type": "wokwi-esp32-devkit-v1",
+      "id": "esp32",
+      "top": 0,
+      "left": 0,
+      "attrs": {}
+    },
+    {
+      "type": "wokwi-dht22",
+      "id": "dht22",
+      "top": -80,
+      "left": 200,
+      "attrs": { "temperature": "22.5", "humidity": "45" }
+    },
+    {
+      "type": "wokwi-potentiometer",
+      "id": "pot1",
+      "top": 80,
+      "left": 200,
+      "attrs": { "value": "50" }
+    }
+  ],
+  "connections": [
+    ["esp32:3V3", "dht22:VCC", "red", []],
+    ["esp32:GND.1", "dht22:GND", "black", []],
+    ["esp32:D15", "dht22:SDA", "green", []],
+    ["esp32:3V3", "pot1:VCC", "red", []],
+    ["esp32:GND.2", "pot1:GND", "black", []],
+    ["esp32:D34", "pot1:SIG", "yellow", []]
+  ]
+}

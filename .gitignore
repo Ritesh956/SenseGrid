@@ -37,6 +37,13 @@ web/**/.next/
 web/**/dist/
 web/**/.env.local
 
+# ESP32 firmware (Phase 9) — config.h/ca_cert.h hold this machine's WiFi
+# creds, claim token, and dev CA (deploy/certs/ca.pem, itself gitignored
+# above); same .example -> real-file pattern as .env.example -> .env.
+firmware/esp32/src/config.h
+firmware/esp32/src/ca_cert.h
+firmware/esp32/.pio/
+
 # OS
 .DS_Store
 Thumbs.db

@@ -1,0 +1,30 @@
+// Copy to config.h (gitignored) before building — same pattern as
+// .env.example -> .env at the repo root. Nothing here is a real secret.
+#pragma once
+
+// Wokwi's virtual network: an open AP with real internet access (see
+// firmware/esp32/README.md). For real hardware, put your actual WiFi
+// credentials here instead.
+#define WIFI_SSID "Wokwi-GUEST"
+#define WIFI_PASSWORD ""
+
+// cmd/control's HTTPS API (POST /v1/devices/claim) and mosquitto's TLS
+// listener. localhost/127.0.0.1 only works when the ESP32 can reach your
+// dev machine directly — for a real device or Wokwi's Private Gateway,
+// use your LAN IP instead, and regenerate certs with
+// LAN_IP=<ip> bash scripts/gen-certs.sh first (see README.md — mosquitto's
+// cert needs that IP in its SAN, or the TLS handshake fails outright,
+// unlike a browser's click-through-the-warning experience).
+#define CONTROL_HOST "192.168.1.100"
+#define CONTROL_PORT 8090
+#define MQTT_HOST "192.168.1.100"
+#define MQTT_PORT 8883
+
+// One-time registration token — mint with:
+//   docker compose -f deploy/docker-compose.yml --env-file .env exec control \
+//     /app token create -name esp32-1 -type esp32 -ttl 1h
+// Only needed for the first boot; the device caches its claimed
+// credentials in NVS (see main.cpp's loadOrClaim) and ignores this after
+// that. Leave empty once claimed — a real token is single-use and a stale
+// one just gets rejected harmlessly.
+#define CLAIM_TOKEN ""
