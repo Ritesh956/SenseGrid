@@ -10,17 +10,18 @@ and a laptop host agent flows through MQTT → NATS JetStream → TimescaleDB, w
 provisions devices and (from Phase 4 on) pushes config back down to them. Synthetic load only enters
 via `cmd/fleet` (Phase 7), not the primary data path — the phone and laptop are real hardware.
 
-**Current status: Phases 0–8 tagged** (`v0.1-phase0`, `v0.2-phase1`, `v0.3-phase2`, `v0.4-phase3`,
-`v0.5-phase4`, `v0.6-phase5`, `v0.7-phase6`, `v0.8-phase7`, `v0.9-phase8`). Phase 8 (hardening &
-production readiness) proved a measured 121s restore RTO against a real 1.3M-row dataset, verified
-compression/retention actually work (92.8% storage saved, lossless) rather than just being configured,
-and found a real bug while load-testing the per-device rate limiter: paho's MQTT client defaults to
-serializing every device's message callback through one goroutine, so a runaway device could starve
-everyone else even though the token bucket is per-device — fixed, and confirmed fixed live. Also
-rotated the dev CA, bumped a CRITICAL-vulnerable `next-auth` (the console's actual login system), and
-cleared every other unaddressed CRITICAL from the Trivy scan across every built image — see "Hardening
-& production readiness (Phase 8)" below. Phase 9 (optional credibility layer — firmware) is next. See
-"Phase status" below before assuming something isn't built yet — check git tags and `internal/` first.
+**Current status: Phases 0–9 tagged** (`v0.1-phase0`, `v0.2-phase1`, `v0.3-phase2`, `v0.4-phase3`,
+`v0.5-phase4`, `v0.6-phase5`, `v0.7-phase6`, `v0.8-phase7`, `v0.9-phase8`, `v0.10-phase9`). Phase 9
+(optional credibility layer — firmware) adds `firmware/esp32`: an Arduino/PlatformIO ESP32 device
+speaking the exact same v1 wire contract as `cmd/hostagent` — claim over HTTPS, MQTT/TLS, a hardware
+timer interrupt (not `delay()`) sampling a DHT22 + potentiometer, and live `sample_rate_hz` config
+applied the same `applyPartial`/`toReported` way `cmd/hostagent/config.go` does — verified against a
+live stack (a client speaking its exact protocol claimed a device, published a reading that landed in
+TimescaleDB through the full pipeline, and showed up via `GET /v1/devices` exactly like a phone or
+laptop, distinguished only by `type:"esp32"` — the Phase 9 DoD itself) rather than just written and
+hoped. See "Optional credibility layer — firmware (Phase 9)" below. Phase 10 (report & submission
+artifacts) is next. See "Phase status" below before assuming something isn't built yet — check git
+tags and `internal/` first.
 
 ## Commands
 
@@ -85,6 +86,11 @@ HOSTAGENT_CLAIM_TOKEN=<token from above> \
 TLS_CA_FILE=deploy/certs/ca.pem \
 go run ./cmd/hostagent
 # second run onward needs no token — credentials cache at ~/.sensegrid/hostagent-device.json
+
+# Build the Phase 9 ESP32 firmware (see firmware/esp32/README.md for the one-time
+# config.h/ca_cert.h setup this needs first)
+pip install platformio
+cd firmware/esp32 && pio run   # -> .pio/build/esp32dev/firmware.{bin,elf}, which wokwi.toml points at
 ```
 
 There is a `Makefile`, but **no `make` binary is installed in this dev environment** — use the raw
@@ -425,6 +431,44 @@ on-call runbook: `docs/runbook.md`. Reproducible drills: `test/hardening/` (same
   network input by our entrypoint) and Next.js's internally-pinned `postcss` (only ever processes this
   repo's own trusted CSS at build time, never untrusted input at request-serving runtime).
 
+### Optional credibility layer — firmware (Phase 9)
+
+`firmware/esp32` is an Arduino/PlatformIO ESP32 project, not a Go binary — it's a firmware-level device
+speaking the exact same v1 wire contract as `cmd/hostagent`, so `cmd/control`/`cmd/ingest`/the console
+need zero changes to accept it. Full build/run instructions: `firmware/esp32/README.md`.
+
+- **Ported field-by-field from the Go reference implementations, not reimplemented from scratch**: the
+  claim request/response shape from `cmd/control/claim.go`, `Reading` from `internal/telemetry`, and
+  `Desired`/`Reported` from `internal/shadow` are all hand-mirrored in C++ since the ESP32 can't import
+  a Go module — `main.cpp`'s `claimDevice()`/`publishReading()`/`mqttCallback()` are the C++ analogues
+  of `internal/provisioning.claim`, `cmd/fleet/device.go`'s per-reading publish, and
+  `cmd/hostagent/config.go`'s `applyPartial`/`toReported`, respectively.
+- **Sampling is timer-interrupt-driven, not `delay()`-paced**: a hardware timer ISR just sets a
+  `volatile` flag; the actual DHT22/ADC reads and MQTT publish happen in `loop()`, not inside the ISR
+  — DHT22's bit-banged single-wire protocol needs interrupts briefly disabled during the read, which is
+  unsafe (and non-reentrant) to do from inside another interrupt context.
+- **Deliberately targets arduino-esp32 core 2.x's timer/watchdog API, not core 3.x's newer one** — found
+  live: the officially-supported PlatformIO `espressif32` platform doesn't ship core 3.x at all (only a
+  community fork does), so code written against 3.x's API (`timerBegin(freq_hz)`,
+  `esp_task_wdt_config_t`) fails to compile on the toolchain most people, and Wokwi's own cloud build,
+  actually have. `platformio.ini`'s comment has the details; this repo's firmware compiles clean against
+  the standard toolchain as a result (verified: RAM 14.3%, flash 71.2%).
+- **Verified against a live stack, not just written and hoped**: a client speaking this firmware's exact
+  protocol (same auth, same topics, same JSON schema) claimed a device via `POST /v1/devices/claim`,
+  connected over MQTT/TLS with the returned credentials, and published a reading that landed correctly
+  in `readings` through the full ingest→JetStream→processor pipeline. `GET /v1/devices` — what the
+  console's fleet view calls — then returned that device in the exact same shape as a phone or laptop,
+  distinguished only by `type:"esp32"`, which is the Phase 9 DoD itself. What's *not* verified is an
+  actual Wokwi run (no Wokwi account/API token available to automate one, and reaching a specific
+  person's LAN/Private Gateway setup isn't something that can be verified in the abstract) — see the
+  README's "What's actually been verified" section for the exact boundary.
+- **Found and fixed a real gap in `scripts/gen-certs.sh` along the way**: `LAN_IP` was only ever added
+  to `control`'s cert SAN, never `mosquitto`'s. Invisible to a browser (an extra click-through on a
+  hostname mismatch, same as the untrusted-CA warning it already shows), but a hard TLS failure for any
+  client that verifies properly with no click-through escape hatch — Go's `crypto/tls`
+  (`cmd/hostagent`, `cmd/fleet`) and this firmware's `WiFiClientSecure` both fall into that category.
+  Fixed by adding `LAN_IP` to both certs' SANs when set.
+
 ## Windows/Git Bash gotchas
 
 These cost real time to find once; don't rediscover them.
@@ -499,7 +543,8 @@ These cost real time to find once; don't rediscover them.
 | 6 — Full observability | `v0.7-phase6` | Prometheus scraping `ingest`/`processor`/`control` (the latter's first `/metrics`, on its own plain-HTTP port); `cmd/control`'s first OTel tracing plus a new `control.ws_relay` span extending a reading's trace through the WS relay; JetStream consumer-lag gauges on both `cmd/processor` consumers; Grafana provisioned entirely as code (`deploy/grafana`) — 3 dashboards (fleet-health, pipeline-latency, alerts) and 3 SLO alert rules (ingest p99 lag, end-to-end p99 latency, consumer lag). See "Observability (Phase 6)" above. |
 | 7 — Synthetic fleet & chaos testing | `v0.8-phase7` | `cmd/fleet` turned into a real device simulator (claimed identity, MQTT/TLS, config subscription, shadow reporting, sinusoidal+drift+noise+anomaly signals across scalar/vector sensors, live-tunable misbehavior), inert by default and driven by its own HTTP control API (`/fleet/scale`, `/fleet/partition`, `/fleet/config`) instead of per-device containers; bulk token issuance (`control token create -count`); `test/chaos`'s five scripts (ramp/kill_broker/kill_processor/pause_db/partition) plus a chart renderer. A real 1000-device ramp found the saturation point (flat through 200 devices, sharp onset at 400–600, implicating the single-instance ingest bridge); broker-restart/processor-kill/DB-pause/partition runs all verified zero data loss. See "Synthetic fleet & chaos testing (Phase 7)" above. |
 | 8 — Hardening & production readiness | `v0.9-phase8` | A measured 121s backup/restore RTO against a real 1.3M-row dataset; compression/retention verified live (92.8% storage saved, lossless) rather than just configured; a real bug found and fixed in the rate limiter (paho's `Order:true` default let a runaway device starve everyone else despite the per-device token bucket — fixed with `SetOrderMatters(false)`, confirmed live before/after); dev CA rotated; zero unaddressed CRITICALs after a govulncheck/npm-audit/Trivy pass across every built image (including a CRITICAL `next-auth` auth-bypass fix in the console). See "Hardening & production readiness (Phase 8)" above. |
-| 9+ | *(not started)* | Optional credibility layer (ESP32 firmware), report & submission artifacts. |
+| 9 — Optional credibility layer (firmware) | `v0.10-phase9` | `firmware/esp32`, an Arduino/PlatformIO ESP32 device speaking the exact v1 wire contract `cmd/hostagent` does — HTTPS claim cached in NVS, MQTT/TLS, timer-interrupt-driven DHT22+potentiometer sampling (not `delay()`), live `sample_rate_hz` config via the same `applyPartial`/`toReported` pattern as `cmd/hostagent/config.go`. Verified live: a client speaking its exact protocol claimed a device, published a reading that landed in TimescaleDB through the full pipeline, and showed up via `GET /v1/devices` exactly like a phone or laptop (`type:"esp32"`) — the Phase 9 DoD itself. Also fixed a real gap in `scripts/gen-certs.sh` (mosquitto's cert never got `LAN_IP` in its SAN, only control's did). See "Optional credibility layer — firmware (Phase 9)" above. |
+| 10+ | *(not started)* | Report & submission artifacts. |
 
 ## Where the full plan lives
 
