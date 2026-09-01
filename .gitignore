@@ -21,9 +21,15 @@ test/chaos/fleet-data/*
 # Chaos-test run output (test/chaos/*.sh, render_charts.py) — reproducible
 # by re-running the scripts against a live stack, tied to whatever machine
 # and fleet size generated it. The report (P10) assembles from a
-# deliberate run's output, not from whatever's sitting here.
+# deliberate run's output, not from whatever's sitting here. The rendered
+# chart PNGs are the exception: docs/phase10-report.md embeds them
+# directly, so they need to be committed for the report to actually
+# render on GitHub — only the raw CSVs (reproducible, run-specific) stay
+# ignored.
 test/chaos/results/*
 !test/chaos/results/.gitkeep
+!test/chaos/results/charts/
+!test/chaos/results/charts/*.png
 
 # Phase 8 hardening drill output (test/hardening/*.sh) — same reasoning as
 # test/chaos/results/ above, plus these can contain actual pg_dump backups
