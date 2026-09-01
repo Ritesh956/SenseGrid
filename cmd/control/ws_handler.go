@@ -107,7 +107,7 @@ func registerWSHandler(mux *http.ServeMux, logger *slog.Logger, nc *nats.Conn, m
 // writes), and ping/pong keepalive so a dead peer — in either direction —
 // is noticed within wsPongWait, not "eventually".
 func serveWSConn(conn *websocket.Conn, nc *nats.Conn, m *metrics, logger *slog.Logger) {
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	m.wsClientsConnected.Inc()
 	defer m.wsClientsConnected.Dec()

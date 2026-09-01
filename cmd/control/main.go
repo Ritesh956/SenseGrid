@@ -94,7 +94,7 @@ func runServer() {
 	defer func() { _ = shutdownTracing(context.Background()) }()
 
 	tokens := devicestore.New(cfg.RedisAddr)
-	defer tokens.Close()
+	defer func() { _ = tokens.Close() }()
 
 	pool, err := pgxpool.New(ctx, cfg.PostgresDSN)
 	if err != nil {

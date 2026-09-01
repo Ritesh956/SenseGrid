@@ -48,7 +48,7 @@ func loadTokenPool(path string) (*tokenPool, error) {
 	if err != nil {
 		return nil, fmt.Errorf("fleet: opening tokens file: %w", err)
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 
 	var toks []string
 	sc := bufio.NewScanner(f)

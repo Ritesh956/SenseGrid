@@ -80,7 +80,7 @@ func claim(ctx context.Context, controlURL, token, caFile string) (Credentials, 
 	if err != nil {
 		return Credentials{}, fmt.Errorf("provisioning: claim request: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 	if resp.StatusCode != http.StatusOK {

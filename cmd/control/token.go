@@ -47,7 +47,7 @@ func runTokenCLI(args []string) error {
 
 	cfg := config.Load("control", defaultHTTPAddr)
 	store := devicestore.New(cfg.RedisAddr)
-	defer store.Close()
+	defer func() { _ = store.Close() }()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
