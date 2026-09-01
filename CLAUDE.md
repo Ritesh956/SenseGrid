@@ -10,18 +10,26 @@ and a laptop host agent flows through MQTT → NATS JetStream → TimescaleDB, w
 provisions devices and (from Phase 4 on) pushes config back down to them. Synthetic load only enters
 via `cmd/fleet` (Phase 7), not the primary data path — the phone and laptop are real hardware.
 
-**Current status: Phases 0–9 tagged** (`v0.1-phase0`, `v0.2-phase1`, `v0.3-phase2`, `v0.4-phase3`,
-`v0.5-phase4`, `v0.6-phase5`, `v0.7-phase6`, `v0.8-phase7`, `v0.9-phase8`, `v0.10-phase9`). Phase 9
-(optional credibility layer — firmware) adds `firmware/esp32`: an Arduino/PlatformIO ESP32 device
-speaking the exact same v1 wire contract as `cmd/hostagent` — claim over HTTPS, MQTT/TLS, a hardware
-timer interrupt (not `delay()`) sampling a DHT22 + potentiometer, and live `sample_rate_hz` config
-applied the same `applyPartial`/`toReported` way `cmd/hostagent/config.go` does — verified against a
-live stack (a client speaking its exact protocol claimed a device, published a reading that landed in
-TimescaleDB through the full pipeline, and showed up via `GET /v1/devices` exactly like a phone or
-laptop, distinguished only by `type:"esp32"` — the Phase 9 DoD itself) rather than just written and
-hoped. See "Optional credibility layer — firmware (Phase 9)" below. Phase 10 (report & submission
-artifacts) is next. See "Phase status" below before assuming something isn't built yet — check git
-tags and `internal/` first.
+**Current status: all 11 phases (0–10) tagged** (`v0.1-phase0`, `v0.2-phase1`, `v0.3-phase2`,
+`v0.4-phase3`, `v0.5-phase4`, `v0.6-phase5`, `v0.7-phase6`, `v0.8-phase7`, `v0.9-phase8`,
+`v0.10-phase9`, `v1.0-phase10`). Phase 9 (optional credibility layer — firmware) adds
+`firmware/esp32`: an Arduino/PlatformIO ESP32 device speaking the exact same v1 wire contract as
+`cmd/hostagent` — claim over HTTPS, MQTT/TLS, a hardware timer interrupt (not `delay()`) sampling a
+DHT22 + potentiometer, and live `sample_rate_hz` config applied the same `applyPartial`/`toReported`
+way `cmd/hostagent/config.go` does — verified against a live stack (a client speaking its exact
+protocol claimed a device, published a reading that landed in TimescaleDB through the full pipeline,
+and showed up via `GET /v1/devices` exactly like a phone or laptop, distinguished only by
+`type:"esp32"` — the Phase 9 DoD itself) rather than just written and hoped. See "Optional
+credibility layer — firmware (Phase 9)" below. Phase 10 (report & submission artifacts) assembled
+the P7/P8 evidence into `docs/phase10-report.md` — architecture diagram with a live-trace-confirmed
+per-hop latency budget, baseline-vs-load latency, the scaling/saturation curve, a failure-recovery
+table, design-decisions write-up, honest scope statement — and, in the process of actually running
+the three chaos drills (`kill_broker.sh`/`kill_processor.sh`/`pause_db.sh`) that Phase 7 had left
+unexecuted, found and fixed a real measurement bug in `test/chaos/lib.sh`'s seq-gap check (it
+compared a fresh run's counter against a device's *entire* readings history with no time bound,
+producing a bogus 43,736-message "loss" reading off a stale reused device_id from five days earlier).
+See "Report & submission artifacts (Phase 10)" below. See "Phase status" below before assuming
+something isn't built yet — check git tags and `internal/` first.
 
 ## Commands
 
@@ -469,6 +477,47 @@ need zero changes to accept it. Full build/run instructions: `firmware/esp32/REA
   (`cmd/hostagent`, `cmd/fleet`) and this firmware's `WiFiClientSecure` both fall into that category.
   Fixed by adding `LAN_IP` to both certs' SANs when set.
 
+### Report & submission artifacts (Phase 10)
+
+`docs/phase10-report.md` is the deliverable — the Blueprint's P10 checklist (architecture diagram
+with a per-hop latency budget, latency baseline vs. under load, the scaling curve with its
+saturation point explained, a failure-recovery table, the backup/restore RTO, a design-decisions
+write-up, and an honest scope statement), assembled from evidence gathered live, not cited from
+memory or fabricated.
+
+- **Three of the four chaos drills had never actually been run before this phase** — only
+  `ramp.sh` had (Phase 7). `kill_broker.sh`, `kill_processor.sh`, `pause_db.sh`, and `partition.sh`
+  were all executed fresh against the real stack for this report: 100-device fleet, broker restart
+  (11s to 100/100 reconnected), processor SIGKILL (6s catchup), TimescaleDB pause (15s catchup, 0
+  duplicate rows — the `ON CONFLICT DO NOTHING` idempotency guard held), and a network partition +
+  shadow config push (3s to converge). All effectively zero data loss.
+- **Found and fixed a real bug in the chaos-test harness itself**: `test/chaos/lib.sh`'s
+  `verify_no_seq_gaps` compared each drill's freshly-reset `fleet_last_seq` against
+  `count(DISTINCT seq)`/`max(seq)` over a device's *entire* history in `readings`, with no time
+  bound. On a stack that already had Phase 7/8 data in it, one device_id reused from the original
+  1000-device ramp test (five days earlier) had accumulated seq values into the hundreds of
+  thousands across past runs, producing a first measured "total_gap" of 43,736 — driven entirely by
+  stale history, not the failure under test. Several other devices in the same reused fleet also
+  carried **retained shadow config** from an old test (a `sample_rate_hz` pushed and never reset),
+  publishing 10–60x faster than the rest of the fleet. Fixed two ways: `verify_no_seq_gaps` now
+  takes an optional `since` timestamp scoping its DB query to `time >= since` (same fix pattern
+  Phase 8's report already applied to `rate_limit_load.sh` for an identical class of problem), and
+  the fleet's real credential cache (`test/chaos/fleet-data/fleet-devices/`, a host bind mount —
+  not the same thing as the unused `deploy_fleet_data` Docker volume, which cost one wasted lookup
+  to discover) was wiped so every device in the report's numbers is a fresh claim.
+- **The per-hop latency budget is backed by a live Jaeger trace, not just the 500ms batch-flush
+  design constant**: `processor.persist` fires ~417–421ms after `ingest.publish` (matching the
+  "100 rows or 500ms, whichever first" flush trigger in `cmd/processor/consumer.go` almost exactly)
+  while its own span duration is under 0.02ms — direct confirmation that the batch *wait*, not the
+  DB write, is the practical cost of the persistence hop. The report also reconciles why this figure
+  is higher than the ramp baseline's measured p50 (0.156s): the trace was captured against a
+  deliberately light 5-device fleet, where the 500ms timer dominates almost completely, versus the
+  ramp baseline's 10 devices producing just enough throughput for a mix of size- and time-triggered
+  flushes.
+- **`test/chaos/render_charts.py` gained a fourth chart function**
+  (`chart_latency_baseline_vs_load`), reusing the same `ramp_*.csv` data as the scaling-curve chart
+  rather than a one-off script, so regenerating the whole report's evidence is one command.
+
 ## Windows/Git Bash gotchas
 
 These cost real time to find once; don't rediscover them.
@@ -544,7 +593,7 @@ These cost real time to find once; don't rediscover them.
 | 7 — Synthetic fleet & chaos testing | `v0.8-phase7` | `cmd/fleet` turned into a real device simulator (claimed identity, MQTT/TLS, config subscription, shadow reporting, sinusoidal+drift+noise+anomaly signals across scalar/vector sensors, live-tunable misbehavior), inert by default and driven by its own HTTP control API (`/fleet/scale`, `/fleet/partition`, `/fleet/config`) instead of per-device containers; bulk token issuance (`control token create -count`); `test/chaos`'s five scripts (ramp/kill_broker/kill_processor/pause_db/partition) plus a chart renderer. A real 1000-device ramp found the saturation point (flat through 200 devices, sharp onset at 400–600, implicating the single-instance ingest bridge); broker-restart/processor-kill/DB-pause/partition runs all verified zero data loss. See "Synthetic fleet & chaos testing (Phase 7)" above. |
 | 8 — Hardening & production readiness | `v0.9-phase8` | A measured 121s backup/restore RTO against a real 1.3M-row dataset; compression/retention verified live (92.8% storage saved, lossless) rather than just configured; a real bug found and fixed in the rate limiter (paho's `Order:true` default let a runaway device starve everyone else despite the per-device token bucket — fixed with `SetOrderMatters(false)`, confirmed live before/after); dev CA rotated; zero unaddressed CRITICALs after a govulncheck/npm-audit/Trivy pass across every built image (including a CRITICAL `next-auth` auth-bypass fix in the console). See "Hardening & production readiness (Phase 8)" above. |
 | 9 — Optional credibility layer (firmware) | `v0.10-phase9` | `firmware/esp32`, an Arduino/PlatformIO ESP32 device speaking the exact v1 wire contract `cmd/hostagent` does — HTTPS claim cached in NVS, MQTT/TLS, timer-interrupt-driven DHT22+potentiometer sampling (not `delay()`), live `sample_rate_hz` config via the same `applyPartial`/`toReported` pattern as `cmd/hostagent/config.go`. Verified live: a client speaking its exact protocol claimed a device, published a reading that landed in TimescaleDB through the full pipeline, and showed up via `GET /v1/devices` exactly like a phone or laptop (`type:"esp32"`) — the Phase 9 DoD itself. Also fixed a real gap in `scripts/gen-certs.sh` (mosquitto's cert never got `LAN_IP` in its SAN, only control's did). See "Optional credibility layer — firmware (Phase 9)" above. |
-| 10+ | *(not started)* | Report & submission artifacts. |
+| 10 — Report & submission artifacts | `v1.0-phase10` | `docs/phase10-report.md`: architecture diagram with a live-Jaeger-trace-confirmed per-hop latency budget, latency baseline vs. under load, the scaling/saturation curve, a failure-recovery table (broker restart, processor kill, DB pause, network partition — all effectively zero data loss), the Phase 8 backup/restore RTO recapped, a design-decisions write-up, and an honest scope statement. Ran three chaos drills live for the first time (`kill_broker.sh`/`kill_processor.sh`/`pause_db.sh`, only `ramp.sh` had run before) and found/fixed a real measurement bug in `test/chaos/lib.sh`'s seq-gap check along the way (a stale reused device_id from the Phase 7 ramp test produced a bogus 43,736-message "loss" reading before a time-scoped fix). See "Report & submission artifacts (Phase 10)" above. |
 
 ## Where the full plan lives
 
