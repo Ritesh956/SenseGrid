@@ -10,6 +10,13 @@ source ./lib.sh
 
 FLEET_SIZE="${FLEET_SIZE:-100}"
 DRAIN_S="${DRAIN_S:-15}"
+# GAP_SINCE: see lib.sh's verify_no_seq_gaps doc comment. Defaults to "now"
+# so a standalone run of this script is still correct; a caller running
+# several chaos scripts back-to-back against the same fleet container
+# should export one shared GAP_SINCE (captured before the first script's
+# fleet_scale) so later scripts' checks aren't polluted by earlier
+# scripts' own valid rows falling outside a fresh per-script window.
+GAP_SINCE="${GAP_SINCE:-$(date -u +%Y-%m-%dT%H:%M:%SZ)}"
 OUT="$RESULTS_DIR/kill_broker_$(date +%Y%m%dT%H%M%S).csv"
 GAP_OUT="$RESULTS_DIR/kill_broker_seq_gaps_$(date +%Y%m%dT%H%M%S).csv"
 
@@ -44,7 +51,7 @@ log "recovered: $connected_after/$FLEET_SIZE connected, ${recovery_time}s after 
 
 log "draining ${DRAIN_S}s for cmd/processor's batched persistence to catch up before checking for gaps"
 sleep "$DRAIN_S"
-total_gap="$(verify_no_seq_gaps "$GAP_OUT" 25)"
+total_gap="$(verify_no_seq_gaps "$GAP_OUT" 25 "$GAP_SINCE")"
 
 csv_row "$OUT" "broker_restart" "$FLEET_SIZE" "$outage_started" "$recovery_time" "$connected_before" "$connected_after" "$total_gap"
 log "kill_broker done -> $OUT (per-device detail: $GAP_OUT)"

@@ -188,8 +188,31 @@ log() {
 # seconds to drain (async batched persistence — cmd/processor's consumer.go)
 # before calling this. Writes one row per checked device to out_csv and
 # echoes the total gap across all sampled devices (0 == zero data loss).
+#
+# `since` (optional, RFC3339) scopes the DB-side count to
+# `time >= since` — required whenever devices/readings can carry state
+# from a previous test session (reused fleet_data credentials, retained
+# shadow config, undropped readings rows from an earlier run). Without it,
+# `fleet_last_seq` (this run's live in-memory counter, reset at process
+# start) gets compared against `distinct(seq)`/`max(seq)` computed over
+# *every* row that device_id has ever had in `readings`, including old
+# runs that also started their own seq counter at 1 — found live on a
+# stack that had been through Phase 7/8 testing already: one reused
+# device_id showed a "total_gap" of 43,736 driven entirely by historical
+# rows from a prior, much longer run, while 90%+ of sampled devices showed
+# large *negative* gaps (old distinct-seq count exceeding this run's small
+# fresh counter) that the `gap > 0` sum silently discards instead of
+# netting out. Same class of trap documented in the Phase 8 hardening
+# report for rate_limit_load.sh's original seq-gap approach — that one
+# switched to a wall-clock window instead of raw seq counters for exactly
+# this reason. Callers running multiple chaos scripts back-to-back in one
+# session (same `cmd/fleet` container, so seq keeps accumulating across
+# scripts) should capture one shared `since` before the first script's
+# `fleet_scale` call and reuse it for all of them — a fresh per-script
+# `since` would incorrectly exclude valid earlier-script rows that this
+# run's cumulative `fleet_last_seq` still counts.
 verify_no_seq_gaps() {
-	local out_csv="$1" sample="${2:-25}"
+	local out_csv="$1" sample="${2:-25}" since="${3:-}"
 	csv_init "$out_csv" "device_id,fleet_last_seq,db_distinct_seq,db_max_seq,gap"
 
 	local status device_ids total_gap=0 checked=0
@@ -206,11 +229,14 @@ verify_no_seq_gaps() {
 	device_ids="$(echo "$status" | jq -r --argjson n "$sample" \
 		'.devices | sort_by(-.seq) | .[:$n][] | select(.seq>0) | .device_id' | tr -d '\r')"
 
+	local time_filter=""
+	[ -n "$since" ] && time_filter=" AND time >= '${since}'"
+
 	while IFS= read -r device_id; do
 		[ -z "$device_id" ] && continue
 		local last_seq row distinct_seq max_seq gap
 		last_seq="$(echo "$status" | jq -r --arg id "$device_id" '.devices[] | select(.device_id==$id) | .seq')"
-		row="$(psql_query "SELECT count(DISTINCT seq), coalesce(max(seq),0) FROM readings WHERE device_id='${device_id}';")"
+		row="$(psql_query "SELECT count(DISTINCT seq), coalesce(max(seq),0) FROM readings WHERE device_id='${device_id}'${time_filter};")"
 		distinct_seq="$(echo "$row" | cut -d'|' -f1)"
 		max_seq="$(echo "$row" | cut -d'|' -f2)"
 		gap=$((last_seq - distinct_seq))

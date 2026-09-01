@@ -14,6 +14,9 @@ source ./lib.sh
 FLEET_SIZE="${FLEET_SIZE:-100}"
 PAUSE_S="${PAUSE_S:-20}"
 DRAIN_S="${DRAIN_S:-15}"
+# GAP_SINCE: see lib.sh's verify_no_seq_gaps doc comment / kill_broker.sh's
+# matching comment — same shared-epoch reasoning applies here.
+GAP_SINCE="${GAP_SINCE:-$(date -u +%Y-%m-%dT%H:%M:%SZ)}"
 OUT="$RESULTS_DIR/pause_db_$(date +%Y%m%dT%H%M%S).csv"
 GAP_OUT="$RESULTS_DIR/pause_db_seq_gaps_$(date +%Y%m%dT%H%M%S).csv"
 
@@ -59,7 +62,7 @@ log "consumer_lag drained to ~$lag after ${catchup_time}s"
 
 log "draining ${DRAIN_S}s more before checking for gaps/duplicates"
 sleep "$DRAIN_S"
-total_gap="$(verify_no_seq_gaps "$GAP_OUT" 25)"
+total_gap="$(verify_no_seq_gaps "$GAP_OUT" 25 "$GAP_SINCE")"
 dupes_after="$(check_no_duplicate_rows)"
 new_dupes=$((dupes_after - dupes_before))
 

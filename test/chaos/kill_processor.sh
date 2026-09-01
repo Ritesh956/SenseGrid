@@ -13,6 +13,9 @@ source ./lib.sh
 FLEET_SIZE="${FLEET_SIZE:-100}"
 OUTAGE_S="${OUTAGE_S:-20}"
 DRAIN_S="${DRAIN_S:-15}"
+# GAP_SINCE: see lib.sh's verify_no_seq_gaps doc comment / kill_broker.sh's
+# matching comment — same shared-epoch reasoning applies here.
+GAP_SINCE="${GAP_SINCE:-$(date -u +%Y-%m-%dT%H:%M:%SZ)}"
 OUT="$RESULTS_DIR/kill_processor_$(date +%Y%m%dT%H%M%S).csv"
 GAP_OUT="$RESULTS_DIR/kill_processor_seq_gaps_$(date +%Y%m%dT%H%M%S).csv"
 
@@ -69,7 +72,7 @@ log "consumer_lag drained to ~$lag after ${catchup_time}s"
 
 log "draining ${DRAIN_S}s more before checking for gaps"
 sleep "$DRAIN_S"
-total_gap="$(verify_no_seq_gaps "$GAP_OUT" 25)"
+total_gap="$(verify_no_seq_gaps "$GAP_OUT" 25 "$GAP_SINCE")"
 
 csv_row "$OUT" "processor_kill" "$FLEET_SIZE" "$outage_started" "$OUTAGE_S" "$catchup_time" "$total_gap"
 log "kill_processor done -> $OUT (per-device detail: $GAP_OUT)"
