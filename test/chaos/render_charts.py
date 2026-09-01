@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """Turns test/chaos/results/*.csv into the P10 report charts (see the
-SenseGrid Blueprint, P7/P10): latency vs. fleet size, recovery time by
-failure mode, and data loss by failure mode. Reads whatever's actually in
-results/ — run ramp.sh/kill_broker.sh/kill_processor.sh/pause_db.sh first,
-any subset is fine, this just skips a chart if its CSVs aren't there.
+SenseGrid Blueprint, P7/P10): latency vs. fleet size, latency baseline vs.
+under load, recovery time by failure mode, and data loss by failure mode.
+Reads whatever's actually in results/ — run
+ramp.sh/kill_broker.sh/kill_processor.sh/pause_db.sh first, any subset is
+fine, this just skips a chart if its CSVs aren't there.
 
-Usage: python render_charts.py [--results-dir DIR] [--out-dir DIR]
+Usage: python render_charts.py [--results-dir DIR] [--out-dir DIR] [--load-fleet-size N]
 Requires: pandas, matplotlib (pip install pandas matplotlib)
 """
 import argparse
@@ -54,6 +55,59 @@ def chart_latency_vs_fleet_size(results_dir, out_dir):
         over = df[df["e2e_p99_s"] > 2 * baseline]
         if not over.empty:
             print(f"note: p99 latency > 2x baseline ({baseline:.3f}s) starting at fleet_size={int(over.iloc[0]['fleet_size'])}")
+
+
+def chart_latency_baseline_vs_load(results_dir, out_dir, load_fleet_size=800):
+    """Docs/phase10-report.md's Section 2: the same ramp_*.csv data as the
+    scaling curve above, but as a direct baseline-vs-load comparison —
+    baseline is the smallest tested fleet_size, load is `load_fleet_size`
+    (default 800, the point past the P7 saturation onset where p99 peaks
+    before 1000 devices' different load shape partially relieves it — see
+    the report's Section 3 for why). Falls back to the largest available
+    fleet_size if the requested one wasn't part of this ramp run.
+    """
+    path = latest(os.path.join(results_dir, "ramp_*.csv"))
+    if not path:
+        print("skip: latency-baseline-vs-load (no ramp_*.csv found — run ramp.sh)")
+        return
+    df = pd.read_csv(path).sort_values("fleet_size")
+    if df.empty:
+        print("skip: latency-baseline-vs-load (ramp_*.csv is empty)")
+        return
+
+    baseline_row = df.iloc[0]
+    load_matches = df[df["fleet_size"] == load_fleet_size]
+    load_row = load_matches.iloc[0] if not load_matches.empty else df.iloc[-1]
+
+    cols = [("e2e_p50_s", "p50"), ("e2e_p95_s", "p95"), ("e2e_p99_s", "p99")]
+    labels = [label for _, label in cols]
+    baseline_vals = [baseline_row[col] for col, _ in cols]
+    load_vals = [load_row[col] for col, _ in cols]
+
+    x = range(len(labels))
+    width = 0.35
+    fig, ax = plt.subplots(figsize=(8, 6))
+    bars_baseline = ax.bar(
+        [i - width / 2 for i in x], baseline_vals, width,
+        label=f"baseline ({int(baseline_row['fleet_size'])} devices)", color="#55A868",
+    )
+    bars_load = ax.bar(
+        [i + width / 2 for i in x], load_vals, width,
+        label=f"under load ({int(load_row['fleet_size'])} devices)", color="#C44E52",
+    )
+    ax.set_xticks(list(x))
+    ax.set_xticklabels(labels)
+    ax.set_ylabel("end-to-end latency (s)")
+    ax.set_title("Latency: baseline vs. under load (Phase 7 ramp data)")
+    ax.legend()
+    for bars in (bars_baseline, bars_load):
+        for b in bars:
+            h = b.get_height()
+            ax.text(b.get_x() + b.get_width() / 2, h, f"{h:.3f}s", ha="center", va="bottom")
+    fig.tight_layout()
+    out = os.path.join(out_dir, "latency_baseline_vs_load.png")
+    fig.savefig(out, dpi=150)
+    print(f"wrote {out} (source: {path})")
 
 
 def chart_recovery_time_by_failure_mode(results_dir, out_dir):
@@ -133,10 +187,12 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--results-dir", default=os.path.join(os.path.dirname(__file__), "results"))
     parser.add_argument("--out-dir", default=os.path.join(os.path.dirname(__file__), "results", "charts"))
+    parser.add_argument("--load-fleet-size", type=int, default=800, help="fleet_size to use as the 'under load' point in the baseline-vs-load chart")
     args = parser.parse_args()
 
     os.makedirs(args.out_dir, exist_ok=True)
     chart_latency_vs_fleet_size(args.results_dir, args.out_dir)
+    chart_latency_baseline_vs_load(args.results_dir, args.out_dir, args.load_fleet_size)
     chart_recovery_time_by_failure_mode(args.results_dir, args.out_dir)
     chart_data_loss_by_failure_mode(args.results_dir, args.out_dir)
 

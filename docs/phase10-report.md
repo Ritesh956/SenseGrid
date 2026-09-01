@@ -75,16 +75,39 @@ which is the one hop with an explicit, code-level bound: **up to 500ms**
 flush trigger) — the only deliberately-introduced latency in the whole
 path, traded for fewer, larger DB writes.
 
-This report doesn't have a live per-span Jaeger breakdown to cite here
-(Jaeger only retains traces for `ingest`/`processor` from the current
-process's uptime, and this stack's fleet load — 100 devices, continuous,
-for the better part of an hour — combined with unrelated Docker
-workloads already running on this machine made the Docker Desktop API
-itself transiently unresponsive while writing this report; see
-`docker compose ... logs` if reproducing). The figures above are the
-measured aggregate end-to-end numbers (below) plus the one
-architecturally-guaranteed per-hop bound (the 500ms batch ceiling) —
-not a claimed measured breakdown of every hop individually.
+**Confirmed with a live Jaeger trace**, pulled against a lightly-loaded
+stack (5 synthetic devices, `GET /api/traces?service=processor`, three
+sampled traces, `ingest.publish` → `processor.window` →
+`processor.persist` per `CLAUDE.md`'s "Data path" section):
+
+| Trace | `ingest.publish` (validate + JetStream publish) | `processor.window` starts at | `processor.persist` starts at | `processor.persist` duration |
+|---|---|---|---|---|
+| `599781e8...` | 4.01ms | +4.32ms | **+421.49ms** | 0.01ms |
+| `2285f42f...` | 0.63ms | +1.90ms | **+416.93ms** | 0.00ms |
+| `059f8f7d...` | 0.68ms | +1.04ms | **+416.89ms** | 0.00ms |
+
+This is a direct confirmation, not just a design-constant inference:
+the windowed (anomaly-detection) consumer picks up a reading in low
+single-digit milliseconds — JetStream's publish-to-consume hop is
+effectively free — while the persistence consumer's actual `INSERT`
+takes **under 0.02ms** once it fires, but doesn't fire until **~417–421ms**
+after the reading was first published. The entire practical cost of
+getting a reading into `readings` is the batch wait, exactly as the
+500ms design constant predicts, and the DB write itself is negligible.
+
+One nuance this trace surfaces that a pure design-constant argument
+wouldn't: this ~420ms figure is *higher* than the ramp baseline's
+measured p50 of 0.156s (Section 2) — because this trace was captured
+against a deliberately light 5-device fleet, where the size trigger
+(100 rows) rarely fires and the 500ms *timer* dominates almost
+completely; the ramp's 10-device baseline had just enough concurrent
+throughput for a mix of size- and time-triggered flushes, pulling the
+p50 down below the timer ceiling. In other words, the batch-wait hop
+isn't a fixed cost — it shrinks as throughput rises (more readings
+means the 100-row trigger fires sooner), until saturation elsewhere
+(Section 3) makes everything worse again. Reproduce this yourself with
+`curl "http://localhost:16686/api/traces?service=processor&limit=3"`
+against a running stack.
 
 ## 2. Latency: baseline vs. under load
 
@@ -274,18 +297,11 @@ convention):
   this report.
 - `test/chaos/lib.sh` — the `verify_no_seq_gaps` time-scoping fix
   (Section 4's "measurement bug" note).
-- `test/chaos/render_charts.py` — the three P7/P10 charts; this report
-  adds one more (`latency_baseline_vs_load.png`, generated inline for
-  Section 2, not yet a standing script — see note below).
+- `test/chaos/render_charts.py` — all four P7/P10 charts, including
+  `chart_latency_baseline_vs_load` (Section 2), folded in as a proper
+  function rather than left as a one-off.
 - `test/chaos/results/*.csv`, `results/charts/*.png` — raw data and
   rendered charts (gitignored; reproducible, not committed).
 - `docs/phase8-hardening-report.md`, `docs/runbook.md` — Phase 8's
   backup/restore, compression/retention, rate-limiter, and secrets-review
   evidence, recapped in Section 5.
-
-**Not yet done**: `latency_baseline_vs_load.png` was generated with a
-one-off inline script rather than added to `render_charts.py` — worth
-folding in if this report is regenerated later. A live per-span Jaeger
-trace breakdown (Section 1) would strengthen the per-hop latency budget
-beyond the current aggregate-plus-design-constant argument, if re-run on
-a machine without competing Docker workloads.
