@@ -40,6 +40,23 @@ export default function ConsoleShell({
                 <Link
                   key={item.href}
                   href={item.href}
+                  // prefetch={false}: found live — the sidebar's three
+                  // sibling routes (Fleet/Alerts/Rollouts, all direct
+                  // children of the (console) route group's shared
+                  // layout) are all in the viewport at once, so Next's
+                  // default Link prefetching fetches every route ahead
+                  // of any click. Clicking one link was then serving a
+                  // *different* sibling's prefetched RSC payload — the
+                  // URL updated correctly but the rendered page didn't
+                  // match it (e.g. clicking Alerts landed on /alerts
+                  // showing the Rollouts page's content). A hard reload
+                  // at the same URL always rendered correctly, isolating
+                  // this to the client-side prefetch/router cache, not
+                  // the route or data logic. Disabling prefetch forces
+                  // every click to fetch fresh, sidestepping it — an
+                  // acceptable trade for a low-traffic internal ops nav
+                  // with only three links.
+                  prefetch={false}
                   className={`rounded px-3 py-2 text-sm ${
                     active ? "bg-surface-2 text-text" : "text-text-muted hover:bg-surface-2 hover:text-text"
                   }`}
