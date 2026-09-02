@@ -22,7 +22,14 @@ jobs:
       - name: Lint
         uses: golangci/golangci-lint-action@v9
         with:
-          version: latest
+          # Pinned, not `latest`. `latest` already broke this workflow once:
+          # bumping the actions to their node24 majors changed which
+          # golangci-lint major it resolved to (v1.64.8 -> v2.13.2), which
+          # surfaced 5 new findings on a commit that touched no Go code. An
+          # unpinned linter turns every upstream release into a potential
+          # red build on an unchanged repo. Bump this deliberately, so the
+          # new findings land in a commit that's actually about them.
+          version: v2.13.2
           # golangci-lint's prebuilt binary release can lag behind the
           # newest Go toolchain (it refuses to analyze a module whose go.mod
           # targets a newer Go version than it was itself built with) —

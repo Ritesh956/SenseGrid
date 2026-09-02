@@ -2,6 +2,17 @@ module github.com/Ritesh956/SenseGrid
 
 go 1.26.0
 
+// Pinned (not just `go 1.26.0`) because the language-version directive above
+// only sets a *floor* — a machine sitting on an older 1.26.x patch builds this
+// repo against that patch's stdlib. Phase 8 fixed 8 reachable stdlib CVEs by
+// bumping the toolchain; they came back purely through the passage of time as
+// new CVEs landed in 1.26.5/1.26.6 and this machine stayed on 1.26.4. A
+// `toolchain` line fixes that reproducibly for every developer and for CI
+// (.github/workflows/ci.yml's `go-version-file: go.mod` honors it), instead of
+// depending on each machine's installed Go being current. Bump this when
+// govulncheck reports new stdlib findings.
+toolchain go1.26.8
+
 require (
 	github.com/distatus/battery v0.11.0
 	github.com/eclipse/paho.mqtt.golang v1.5.1

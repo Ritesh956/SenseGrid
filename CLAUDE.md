@@ -38,7 +38,7 @@ something isn't built yet — check git tags and `internal/` first.
 go build ./...
 go vet ./...
 gofmt -l .              # must be empty; gofmt -w . to fix
-go test ./... -race
+go test ./...           # -race needs a 64-bit C toolchain — see the gotcha below
 
 # Build one binary
 go build -o /tmp/x ./cmd/ingest
@@ -545,6 +545,15 @@ memory or fabricated.
 
 These cost real time to find once; don't rediscover them.
 
+- **`go test ./... -race` does not run in this dev environment**, and the failure looks like broken
+  code rather than a broken toolchain: every package fails with `# runtime/cgo` / `cc1.exe: sorry,
+  unimplemented: 64-bit mode not compiled in`. The race detector requires cgo, cgo requires a C
+  compiler matching `GOARCH`, and the `gcc` on PATH here is MinGW.org's GCC 6.3.0 — a 32-bit-only
+  build (`gcc -dumpmachine` → `mingw32`) while Go targets `amd64`. Nothing is wrong with the code:
+  plain `go test ./...` passes every package. Race coverage is real but happens in CI, which runs
+  `go test ./... -race` on `ubuntu-latest` (`.github/workflows/ci.yml`). To get it locally you'd
+  need a 64-bit toolchain (mingw-w64 / MSYS2's `mingw-w64-x86_64-gcc`) ahead of MinGW.org's gcc on
+  PATH — worth doing before trusting a local run, not worth blocking on otherwise.
 - **MSYS path mangling**: Git Bash rewrites any bare argument starting with `/` into a Windows path
   before handing it to a non-MSYS executable (`docker exec ... /app ...` becomes `docker exec ...
   C:/Program Files/Git/app ...`). Symptoms: `stat ... no such file or directory` for a path that
