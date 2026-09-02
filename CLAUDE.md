@@ -12,7 +12,7 @@ via `cmd/fleet` (Phase 7), not the primary data path — the phone and laptop ar
 
 **Current status: all 11 phases (0–10) tagged** (`v0.1-phase0`, `v0.2-phase1`, `v0.3-phase2`,
 `v0.4-phase3`, `v0.5-phase4`, `v0.6-phase5`, `v0.7-phase6`, `v0.8-phase7`, `v0.9-phase8`,
-`v0.10-phase9`, `v1.0-phase10`, `v1.0.1-phase10`). Phase 9 (optional credibility layer — firmware) adds
+`v0.10-phase9`, `v1.0-phase10`, `v1.0.1-phase10`, `v1.0.2-phase10`). Phase 9 (optional credibility layer — firmware) adds
 `firmware/esp32`: an Arduino/PlatformIO ESP32 device speaking the exact same v1 wire contract as
 `cmd/hostagent` — claim over HTTPS, MQTT/TLS, a hardware timer interrupt (not `delay()`) sampling a
 DHT22 + potentiometer, and live `sample_rate_hz` config applied the same `applyPartial`/`toReported`
@@ -291,6 +291,29 @@ model" above); the device-detail page polls `GET /v1/devices/{id}/shadow` instea
 root module's `go build ./...`/`go test ./...` would otherwise walk into and pick up. A `go.mod` here
 (nothing ever imports it) marks the whole subtree as a separate module, which the root module's `...`
 pattern skips automatically. Found live after `npm install` in this directory, not theoretical.
+
+**Sidebar nav bug found and fixed post-Phase-10** (`web/console/src/components/ConsoleShell.tsx`):
+clicking Alerts or Rollouts in the sidebar updated the URL correctly but rendered a *different*
+sibling route's content — e.g. `/alerts` showing the Rollouts page. All three sidebar links
+(Fleet/Alerts/Rollouts) sit in the viewport at once, so Next's default `<Link>` prefetching fetches
+every route ahead of any click; the client router cache then served the wrong prefetched payload on
+navigation. A hard reload at the same URL always rendered correctly, isolating this to the client-side
+prefetch/router cache rather than the route or data logic. Fixed with `prefetch={false}` on the three
+nav links — an acceptable trade for a low-traffic internal ops nav with only three links, forcing every
+click to fetch fresh RSC content instead of relying on the prefetch cache. Verified by rebuilding and
+clicking through all three views repeatedly.
+
+**A separate, non-bug finding from the same investigation**: the Fleet page's per-device sample-rate
+column (`FleetPage`'s `SampleRate` component, `src/app/(console)/page.tsx`) polls each visible device's
+`GET /api/devices/{id}/shadow` individually every 5s via `useSWR` — already documented in its own code
+comment as "fine at this fleet's scale (a handful of real devices), not worth a new bulk-shadow Go
+endpoint just for one column." That assumption held until this dev stack accumulated ~1,100 leftover
+`type:"fleet"` devices across Phase 7/8/10's chaos and load testing — at that scale the per-row polling
+saturates the browser's per-origin connection pool, and everything else (including nav clicks and the
+WS reconnect) gets visibly slower behind the queue. Not a code bug — the fix is operational (clean up
+stale test devices, e.g. `DELETE FROM devices WHERE type='fleet'` cascaded through
+`readings`/`alerts`/`shadow_history`/`rollout_targets` first), not a code change — but worth knowing if
+the console feels sluggish in a dev environment that's seen a lot of `cmd/fleet` load testing.
 
 ### Observability (Phase 6)
 
@@ -593,7 +616,7 @@ These cost real time to find once; don't rediscover them.
 | 7 — Synthetic fleet & chaos testing | `v0.8-phase7` | `cmd/fleet` turned into a real device simulator (claimed identity, MQTT/TLS, config subscription, shadow reporting, sinusoidal+drift+noise+anomaly signals across scalar/vector sensors, live-tunable misbehavior), inert by default and driven by its own HTTP control API (`/fleet/scale`, `/fleet/partition`, `/fleet/config`) instead of per-device containers; bulk token issuance (`control token create -count`); `test/chaos`'s five scripts (ramp/kill_broker/kill_processor/pause_db/partition) plus a chart renderer. A real 1000-device ramp found the saturation point (flat through 200 devices, sharp onset at 400–600, implicating the single-instance ingest bridge); broker-restart/processor-kill/DB-pause/partition runs all verified zero data loss. See "Synthetic fleet & chaos testing (Phase 7)" above. |
 | 8 — Hardening & production readiness | `v0.9-phase8` | A measured 121s backup/restore RTO against a real 1.3M-row dataset; compression/retention verified live (92.8% storage saved, lossless) rather than just configured; a real bug found and fixed in the rate limiter (paho's `Order:true` default let a runaway device starve everyone else despite the per-device token bucket — fixed with `SetOrderMatters(false)`, confirmed live before/after); dev CA rotated; zero unaddressed CRITICALs after a govulncheck/npm-audit/Trivy pass across every built image (including a CRITICAL `next-auth` auth-bypass fix in the console). See "Hardening & production readiness (Phase 8)" above. |
 | 9 — Optional credibility layer (firmware) | `v0.10-phase9` | `firmware/esp32`, an Arduino/PlatformIO ESP32 device speaking the exact v1 wire contract `cmd/hostagent` does — HTTPS claim cached in NVS, MQTT/TLS, timer-interrupt-driven DHT22+potentiometer sampling (not `delay()`), live `sample_rate_hz` config via the same `applyPartial`/`toReported` pattern as `cmd/hostagent/config.go`. Verified live: a client speaking its exact protocol claimed a device, published a reading that landed in TimescaleDB through the full pipeline, and showed up via `GET /v1/devices` exactly like a phone or laptop (`type:"esp32"`) — the Phase 9 DoD itself. Also fixed a real gap in `scripts/gen-certs.sh` (mosquitto's cert never got `LAN_IP` in its SAN, only control's did). See "Optional credibility layer — firmware (Phase 9)" above. |
-| 10 — Report & submission artifacts | `v1.0-phase10`, `v1.0.1-phase10` | `docs/phase10-report.md`: architecture diagram with a live-Jaeger-trace-confirmed per-hop latency budget, latency baseline vs. under load, the scaling/saturation curve, a failure-recovery table (broker restart, processor kill, DB pause, network partition — all effectively zero data loss), the Phase 8 backup/restore RTO recapped, a design-decisions write-up, and an honest scope statement. Ran three chaos drills live for the first time (`kill_broker.sh`/`kill_processor.sh`/`pause_db.sh`, only `ramp.sh` had run before) and found/fixed a real measurement bug in `test/chaos/lib.sh`'s seq-gap check along the way (a stale reused device_id from the Phase 7 ramp test produced a bogus 43,736-message "loss" reading before a time-scoped fix). See "Report & submission artifacts (Phase 10)" above. `v1.0.1-phase10` is a follow-up patch tag (not a new phase): bumped `.github/workflows/ci.yml`'s actions to their `node24`-native majors (fixing a Node 20 deprecation warning), which changed which golangci-lint major `version: latest` + `install-mode: goinstall` resolves to (v1.64.8 → v2.13.2) and surfaced 5 real unchecked-`Close()`-error findings, fixed with the same `defer func() { _ = x.Close() }()` pattern already used for `shutdownTracing` in `cmd/control/main.go`. |
+| 10 — Report & submission artifacts | `v1.0-phase10`, `v1.0.1-phase10`, `v1.0.2-phase10` | `docs/phase10-report.md`: architecture diagram with a live-Jaeger-trace-confirmed per-hop latency budget, latency baseline vs. under load, the scaling/saturation curve, a failure-recovery table (broker restart, processor kill, DB pause, network partition — all effectively zero data loss), the Phase 8 backup/restore RTO recapped, a design-decisions write-up, and an honest scope statement. Ran three chaos drills live for the first time (`kill_broker.sh`/`kill_processor.sh`/`pause_db.sh`, only `ramp.sh` had run before) and found/fixed a real measurement bug in `test/chaos/lib.sh`'s seq-gap check along the way (a stale reused device_id from the Phase 7 ramp test produced a bogus 43,736-message "loss" reading before a time-scoped fix). See "Report & submission artifacts (Phase 10)" above. `v1.0.1-phase10` is a follow-up patch tag (not a new phase): bumped `.github/workflows/ci.yml`'s actions to their `node24`-native majors (fixing a Node 20 deprecation warning), which changed which golangci-lint major `version: latest` + `install-mode: goinstall` resolves to (v1.64.8 → v2.13.2) and surfaced 5 real unchecked-`Close()`-error findings, fixed with the same `defer func() { _ = x.Close() }()` pattern already used for `shutdownTracing` in `cmd/control/main.go`. `v1.0.2-phase10` is a second follow-up patch: added a top-level `README.md` (previously missing entirely) with the architecture, quickstart, and a full theory/mechanics/application write-up, committed the P10 report's chart PNGs (they were gitignored as "reproducible run output," making the report's embedded images broken links on GitHub), and fixed a real console bug — the sidebar nav rendering a sibling route's stale prefetched content on click, found by manually clicking through the console in a browser after the report was already done. See "Console (Phase 5)" above for the nav bug and the related stale-fleet-devices performance finding. |
 
 ## Where the full plan lives
 
