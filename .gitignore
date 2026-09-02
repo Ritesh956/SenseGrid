@@ -37,6 +37,14 @@ test/chaos/results/*
 test/hardening/results/*
 !test/hardening/results/.gitkeep
 
+# Python bytecode cache — test/chaos/render_charts.py is this repo's only
+# Python. Running it directly doesn't produce one (CPython only writes
+# __pycache__ for *imported* modules), but importing it or byte-compiling
+# it (`python -m py_compile`) does, and it's untracked noise in
+# `git status` either way.
+__pycache__/
+*.pyc
+
 # Node (web/console, web/sensor-client — Phase 5/1)
 web/**/node_modules/
 web/**/.next/
